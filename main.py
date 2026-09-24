@@ -1,297 +1,340 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 import requests
 import pandas as pd
-import math
 
-app = FastAPI(title="Crypto Analyzer Online API")
-
-BINANCE = "https://api.binance.com/api/v3/klines"
+app = FastAPI(title="Crypto Analyzer Online")
 
 
-def candles(symbol, interval, limit=250):
-    r = requests.get(
-        BINANCE,
-        params={
-            "symbol": symbol.upper(),
-            "interval": interval,
-            "limit": limit
-        },
-        timeout=12
-    )
-    r.raise_for_status()
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
 
-    rows = r.json()
 
-    if not rows:
-        raise ValueError("No market data")
+def get_candles(symbol="BTCUSDT", interval="1h", limit=200):
+    params = {
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "limit": limit
+    }
 
-    df = pd.DataFrame(
-        rows,
-        columns=[
-            "t", "o", "h", "l", "c", "v",
-            "x1", "q", "n", "tb", "tq", "x2"
-        ]
-    )
+    r = requests.get(BINANCE_URL, params=params, timeout=15)
 
-    for c in ["o", "h", "l", "c", "v"]:
-        df[c] = pd.to_numeric(df[c])
+    if r.status_code != 200:
+        raise HTTPException(
+            status_code=400,
+            detail="ارز یا تایم‌فریم معتبر نیست."
+        )
+
+    data = r.json()
+
+    if not isinstance(data, list) or len(data) < 50:
+        raise HTTPException(
+            status_code=400,
+            detail="داده کافی برای تحلیل وجود ندارد."
+        )
+
+    df = pd.DataFrame(data, columns=[
+        "time", "open", "high", "low", "close",
+        "volume", "close_time", "qav",
+        "trades", "tb_base", "tb_quote", "ignore"
+    ])
+
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col])
 
     return df
 
 
-def ema(series, period):
-    return series.ewm(
-        span=period,
-        adjust=False
-    ).mean()
-
-
-def rsi(series, period=14):
-    delta = series.diff()
+def calculate_rsi(close, period=14):
+    delta = close.diff()
 
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(
-        alpha=1 / period,
-        adjust=False
-    ).mean()
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
 
-    avg_loss = loss.ewm(
-        alpha=1 / period,
-        adjust=False
-    ).mean()
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
 
-    rs = avg_gain / avg_loss.replace(0, math.nan)
-
-    return (
-        100 - (100 / (1 + rs))
-    ).fillna(50)
+    return 100 - (100 / (1 + rs))
 
 
-def atr(df, period=14):
-    previous_close = df["c"].shift()
+def analyze_market(symbol, interval):
+    df = get_candles(symbol, interval)
 
-    tr = pd.concat(
-        [
-            df["h"] - df["l"],
-            (df["h"] - previous_close).abs(),
-            (df["l"] - previous_close).abs()
-        ],
-        axis=1
-    ).max(axis=1)
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
 
-    return tr.ewm(
-        alpha=1 / period,
-        adjust=False
-    ).mean()
+    # EMA
+    df["ema20"] = close.ewm(span=20, adjust=False).mean()
+    df["ema50"] = close.ewm(span=50, adjust=False).mean()
+    df["ema200"] = close.ewm(span=200, adjust=False).mean()
 
+    # RSI
+    df["rsi"] = calculate_rsi(close)
 
-def macd(series):
-    return ema(series, 12) - ema(series, 26)
+    # MACD
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
 
+    df["macd"] = ema12 - ema26
+    df["signal"] = df["macd"].ewm(span=9, adjust=False).mean()
 
-@app.get("/")
-def root():
+    # ATR
+    previous_close = close.shift(1)
+
+    tr = pd.concat([
+        high - low,
+        (high - previous_close).abs(),
+        (low - previous_close).abs()
+    ], axis=1).max(axis=1)
+
+    df["atr"] = tr.rolling(14).mean()
+
+    last = df.iloc[-1]
+
+    price = float(last["close"])
+    ema20 = float(last["ema20"])
+    ema50 = float(last["ema50"])
+    ema200 = float(last["ema200"])
+    rsi = float(last["rsi"])
+    macd = float(last["macd"])
+    macd_signal = float(last["signal"])
+    atr = float(last["atr"])
+
+    support = float(df["low"].tail(50).min())
+    resistance = float(df["high"].tail(50).max())
+
+    bullish = 0
+    bearish = 0
+
+    # Trend
+    if price > ema20:
+        bullish += 1
+    else:
+        bearish += 1
+
+    if ema20 > ema50:
+        bullish += 1
+    else:
+        bearish += 1
+
+    if price > ema200:
+        bullish += 1
+    else:
+        bearish += 1
+
+    # RSI
+    if 50 <= rsi <= 70:
+        bullish += 1
+    elif 30 <= rsi < 50:
+        bearish += 1
+
+    # MACD
+    if macd > macd_signal:
+        bullish += 1
+    else:
+        bearish += 1
+
+    # Signal
+    if bullish >= 4 and bullish > bearish:
+        signal = "LONG"
+        entry = price
+        stop_loss = price - (atr * 1.5)
+        tp1 = price + (atr * 2)
+        tp2 = price + (atr * 3)
+        tp3 = price + (atr * 4)
+
+    elif bearish >= 4 and bearish > bullish:
+        signal = "SHORT"
+        entry = price
+        stop_loss = price + (atr * 1.5)
+        tp1 = price - (atr * 2)
+        tp2 = price - (atr * 3)
+        tp3 = price - (atr * 4)
+
+    else:
+        signal = "NO TRADE"
+        entry = price
+        stop_loss = None
+        tp1 = None
+        tp2 = None
+        tp3 = None
+
     return {
-        "status": "online",
-        "service": "Crypto Analyzer"
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "price": round(price, 8),
+
+        "signal": signal,
+
+        "entry": round(entry, 8),
+
+        "stop_loss": (
+            round(stop_loss, 8)
+            if stop_loss is not None else None
+        ),
+
+        "take_profit_1": (
+            round(tp1, 8)
+            if tp1 is not None else None
+        ),
+
+        "take_profit_2": (
+            round(tp2, 8)
+            if tp2 is not None else None
+        ),
+
+        "take_profit_3": (
+            round(tp3, 8)
+            if tp3 is not None else None
+        ),
+
+        "support": round(support, 8),
+        "resistance": round(resistance, 8),
+
+        "indicators": {
+            "ema20": round(ema20, 8),
+            "ema50": round(ema50, 8),
+            "ema200": round(ema200, 8),
+            "rsi": round(rsi, 2),
+            "macd": round(macd, 8),
+            "macd_signal": round(macd_signal, 8),
+            "atr": round(atr, 8)
+        },
+
+        "bullish_score": bullish,
+        "bearish_score": bearish,
+
+        "note": "این خروجی تحلیل تکنیکال است و تضمین سود یا توصیه قطعی معامله نیست."
     }
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
+        <title>Crypto Analyzer</title>
+        <style>
+            body {
+                font-family: Arial;
+                background:#0b1220;
+                color:white;
+                padding:25px;
+            }
+
+            .box {
+                max-width:700px;
+                margin:auto;
+                background:#151f33;
+                padding:25px;
+                border-radius:18px;
+            }
+
+            input, select, button {
+                width:100%;
+                padding:14px;
+                margin:8px 0;
+                border-radius:10px;
+                border:0;
+                box-sizing:border-box;
+            }
+
+            button {
+                background:#16a34a;
+                color:white;
+                font-size:17px;
+                font-weight:bold;
+            }
+
+            pre {
+                white-space:pre-wrap;
+                background:#08101d;
+                padding:15px;
+                border-radius:10px;
+            }
+        </style>
+    </head>
+
+    <body>
+
+    <div class="box">
+
+        <h1>📊 Crypto Analyzer Online</h1>
+
+        <p>تحلیل آنلاین بازار ارز دیجیتال</p>
+
+        <input id="symbol"
+               value="BTCUSDT"
+               placeholder="مثلاً BTCUSDT">
+
+        <select id="interval">
+            <option value="15m">15 دقیقه</option>
+            <option value="1h" selected>1 ساعت</option>
+            <option value="4h">4 ساعت</option>
+            <option value="1d">1 روز</option>
+        </select>
+
+        <button onclick="analyze()">
+            🔍 تحلیل بازار
+        </button>
+
+        <pre id="result">آماده تحلیل...</pre>
+
+    </div>
+
+    <script>
+
+    async function analyze() {
+
+        const symbol =
+            document.getElementById("symbol").value;
+
+        const interval =
+            document.getElementById("interval").value;
+
+        document.getElementById("result").textContent =
+            "در حال دریافت اطلاعات بازار...";
+
+        try {
+
+            const response =
+                await fetch(
+                    `/analyze?symbol=${symbol}&interval=${interval}`
+                );
+
+            const data = await response.json();
+
+            document.getElementById("result").textContent =
+                JSON.stringify(data, null, 2);
+
+        } catch(error) {
+
+            document.getElementById("result").textContent =
+                "خطا در دریافت اطلاعات بازار";
+
+        }
+    }
+
+    </script>
+
+    </body>
+    </html>
+    """
+
+
+@app.get("/analyze")
+def analyze(symbol: str = "BTCUSDT", interval: str = "1h"):
+    return analyze_market(symbol, interval)
 
 
 @app.get("/health")
 def health():
     return {
-        "status": "ok"
-    }
-
-
-@app.get("/analyze")
-def analyze(
-    symbol: str = "BTCUSDT",
-    interval: str = "1h"
-):
-
-    try:
-        df = candles(symbol, interval)
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Market data error: {e}"
-        )
-
-    close = df["c"]
-
-    price = float(close.iloc[-1])
-
-    ema20 = ema(close, 20)
-    ema50 = ema(close, 50)
-    ema200 = ema(close, 200)
-
-    rsi_value = float(rsi(close).iloc[-1])
-    macd_value = float(macd(close).iloc[-1])
-    atr_value = float(atr(df).iloc[-1])
-
-    support = float(
-        df["l"].tail(50).min()
-    )
-
-    resistance = float(
-        df["h"].tail(50).max()
-    )
-
-    bullish = (
-        price > ema20.iloc[-1]
-        and ema20.iloc[-1] > ema50.iloc[-1]
-    )
-
-    bearish = (
-        price < ema20.iloc[-1]
-        and ema20.iloc[-1] < ema50.iloc[-1]
-    )
-
-    score = 50
-
-    if bullish:
-        score += 15
-
-    if bearish:
-        score -= 15
-
-    if rsi_value > 55:
-        score += 10
-
-    elif rsi_value < 45:
-        score -= 10
-
-    if macd_value > 0:
-        score += 10
-
-    else:
-        score -= 10
-
-    score = max(
-        0,
-        min(100, score)
-    )
-
-    if (
-        bullish
-        and rsi_value >= 50
-        and macd_value > 0
-    ):
-        signal = "LONG"
-
-    elif (
-        bearish
-        and rsi_value <= 50
-        and macd_value < 0
-    ):
-        signal = "SHORT"
-
-    else:
-        signal = "NO TRADE"
-
-    if signal == "LONG":
-
-        entry = price
-
-        stop_loss = max(
-            support,
-            price - 1.5 * atr_value
-        )
-
-        risk = max(
-            price - stop_loss,
-            atr_value * 0.5
-        )
-
-        tp1 = price + 1.5 * risk
-        tp2 = price + 2.5 * risk
-        tp3 = price + 4 * risk
-
-    elif signal == "SHORT":
-
-        entry = price
-
-        stop_loss = min(
-            resistance,
-            price + 1.5 * atr_value
-        )
-
-        risk = max(
-            stop_loss - price,
-            atr_value * 0.5
-        )
-
-        tp1 = price - 1.5 * risk
-        tp2 = price - 2.5 * risk
-        tp3 = price - 4 * risk
-
-    else:
-
-        entry = price
-        stop_loss = price
-        tp1 = price
-        tp2 = price
-        tp3 = price
-
-    if bullish:
-        trend = "صعودی"
-
-    elif bearish:
-        trend = "نزولی"
-
-    else:
-        trend = "خنثی"
-
-    return {
-        "symbol": symbol.upper(),
-        "interval": interval,
-        "signal": signal,
-        "score": round(score, 1),
-
-        "price": price,
-        "entry": round(entry, 8),
-
-        "stop_loss": round(
-            stop_loss,
-            8
-        ),
-
-        "tp1": round(tp1, 8),
-        "tp2": round(tp2, 8),
-        "tp3": round(tp3, 8),
-
-        "support": round(
-            support,
-            8
-        ),
-
-        "resistance": round(
-            resistance,
-            8
-        ),
-
-        "rsi": round(
-            rsi_value,
-            2
-        ),
-
-        "macd": round(
-            macd_value,
-            8
-        ),
-
-        "atr": round(
-            atr_value,
-            8
-        ),
-
-        "trend": trend,
-
-        "note":
-            "این خروجی تحلیل احتمالاتی بازار است و "
-            "تضمین سود یا توصیه مالی نیست."
+        "status": "online",
+        "service": "crypto-analyzer"
     }
