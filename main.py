@@ -6,7 +6,7 @@ import math
 
 app = FastAPI(title="Crypto Analyzer Online", version="2.0.0")
 
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_URL = "https://api.binance.us/api/v3/klines"
 
 INTERVALS = {
     "1m":"1m","5m":"5m","15m":"15m","30m":"30m",
