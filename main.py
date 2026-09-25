@@ -730,7 +730,11 @@ else:
         ),
 
         "score": score,
+"confidence": confidence,
 
+"risk_reward_1": rr1,
+"risk_reward_2": rr2,
+"risk_reward_3": rr3,
         "reasons": reasons
     }
 
