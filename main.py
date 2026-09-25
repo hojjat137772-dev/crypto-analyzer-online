@@ -616,6 +616,69 @@ else:
 
     reasons.append(
         "شرایط فعلی برای ورود قدرتمند کافی نیست."
+    )# --------------------
+# SMART SIGNAL ENGINE
+# --------------------
+
+signal = "NO TRADE"
+entry = price
+
+stop_loss = None
+tp1 = None
+tp2 = None
+tp3 = None
+risk = None
+
+# قدرت روند بر اساس امتیاز فعلی
+trend_strength = min(100, abs(score) * 20)
+
+# LONG
+if score >= 3:
+    signal = "LONG"
+    entry = price
+
+    risk = max(current_atr * 1.5, price * 0.005)
+
+    stop_loss = entry - risk
+
+    tp1 = entry + (risk * 1.5)
+    tp2 = entry + (risk * 2.5)
+    tp3 = entry + (risk * 3.5)
+
+    reasons.append(
+        "سیگنال LONG بر اساس مجموع شرایط تکنیکال صادر شد."
+    )
+
+# SHORT
+elif score <= -3:
+    signal = "SHORT"
+    entry = price
+
+    risk = max(current_atr * 1.5, price * 0.005)
+
+    stop_loss = entry + risk
+
+    tp1 = entry - (risk * 1.5)
+    tp2 = entry - (risk * 2.5)
+    tp3 = entry - (risk * 3.5)
+
+    reasons.append(
+        "سیگنال SHORT بر اساس مجموع شرایط تکنیکال صادر شد."
+    )
+
+# NO TRADE
+else:
+    signal = "NO TRADE"
+    entry = price
+
+    stop_loss = None
+    tp1 = None
+    tp2 = None
+    tp3 = None
+    risk = None
+
+    reasons.append(
+        "شرایط کافی برای ورود به معامله وجود ندارد."
     )
     # -------------------------
     # Confidence 0 - 100
@@ -691,7 +754,7 @@ return {
     "risk": rnd(risk),
 
     "confidence": confidence,
-
+"trend_strength": trend_strength,
     "rr1": rr1,
     "rr2": rr2,
     "rr3": rr3,
