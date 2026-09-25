@@ -553,12 +553,15 @@ score = max(-6, min(6, score))
 signal = "NO TRADE"
 entry = price
 
+# SMART ENTRY ZONE
+entry_low = None
+entry_high = None
+
 stop_loss = None
 tp1 = None
 tp2 = None
 tp3 = None
 risk = None
-
 # -----------------------
 # LONG
 # -----------------------
@@ -567,7 +570,13 @@ if score >= 3:
 
     signal = "LONG"
     entry = price
+# SMART LONG ENTRY ZONE
+entry_low = min(price, float(x["ema20"])) - (0.25 * current_atr)
+entry_high = max(price, float(x["ema20"])) + (0.15 * current_atr)
 
+# جلوگیری از ورود به محدوده خیلی دور
+entry_low = max(entry_low, price - (1.0 * current_atr))
+entry_high = min(entry_high, price + (0.5 * current_atr))
     # حد ضرر ترکیبی:
     # حمایت + ATR
     atr_stop = price - (1.5 * current_atr)
@@ -613,7 +622,13 @@ elif score <= -3:
 
     signal = "SHORT"
     entry = price
+# SMART SHORT ENTRY ZONE
+entry_low = min(price, float(x["ema20"])) - (0.15 * current_atr)
+entry_high = max(price, float(x["ema20"])) + (0.25 * current_atr)
 
+# جلوگیری از ورود به محدوده خیلی دور
+entry_low = max(entry_low, price - (0.5 * current_atr))
+entry_high = min(entry_high, price + (1.0 * current_atr))
     # حد ضرر ترکیبی:
     # مقاومت + ATR
     atr_stop = price + (1.5 * current_atr)
@@ -779,6 +794,8 @@ return {
     "signal": signal,
 
     "price": rnd(price),
+    "entry_low": rnd(entry_low),
+"entry_high": rnd(entry_high),
     "entry": rnd(entry),
 
     "stop_loss": rnd(stop_loss),
