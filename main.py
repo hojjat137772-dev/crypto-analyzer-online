@@ -1297,7 +1297,53 @@ ${data.score}
 
 </div>
 
+<div class="box">
 
+اعتماد سیگنال
+
+<br>
+
+<b>
+${formatNumber(data.confidence)}%
+</b>
+
+</div>
+
+<div class="box">
+
+R/R - TP1
+
+<br>
+
+<b>
+${formatNumber(data.risk_reward_1)}
+</b>
+
+</div>
+
+<div class="box">
+
+R/R - TP2
+
+<br>
+
+<b>
+${formatNumber(data.risk_reward_2)}
+</b>
+
+</div>
+
+<div class="box">
+
+R/R - TP3
+
+<br>
+
+<b>
+${formatNumber(data.risk_reward_3)}
+</b>
+
+</div>
 <div class="box">
 
 حمایت
