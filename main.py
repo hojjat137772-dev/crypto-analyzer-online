@@ -990,7 +990,246 @@ def get_multi_timeframe_analysis(symbol):
         "1d": d1,
         "final_signal": final_trend,
         "alignment": alignment
+    }# =================================================
+# STAGE 8 — BACKTEST ENGINE
+# =================================================
+
+def backtest_strategy(df):
+    """
+    بک‌تست پایه استراتژی روی داده‌های تاریخی
+    """
+
+    d = add_indicators(df).copy()
+    d = d.dropna().reset_index(drop=True)
+
+    trades = []
+    equity = 0.0
+    peak_equity = 0.0
+    max_drawdown = 0.0
+
+    wins = 0
+    losses = 0
+    longs = 0
+    shorts = 0
+
+    # حداقل داده مورد نیاز
+    if len(d) < 50:
+        return {
+            "status": "error",
+            "message": "داده تاریخی کافی نیست."
+        }
+
+    for i in range(50, len(d) - 1):
+
+        x = d.iloc[i]
+
+        price = float(x["close"])
+        atr = float(x["atr"])
+        rsi = float(x["rsi"])
+
+        if atr <= 0:
+            continue
+
+        score = 0
+
+        # EMA20 / Price
+        if price > float(x["ema20"]):
+            score += 1
+        else:
+            score -= 1
+
+        # EMA20 / EMA50
+        if float(x["ema20"]) > float(x["ema50"]):
+            score += 1
+        else:
+            score -= 1
+
+        # EMA50 / EMA200
+        if float(x["ema50"]) > float(x["ema200"]):
+            score += 1
+        else:
+            score -= 1
+
+        # RSI
+        if rsi >= 60:
+            score += 1
+        elif rsi <= 40:
+            score -= 1
+
+        # MACD
+        if float(x["macd_hist"]) > 0:
+            score += 1
+        else:
+            score -= 1
+
+        # Volume
+        volume_ratio = float(
+            x.get("volume_ratio", 1)
+        )
+
+        if volume_ratio >= 1.20:
+            if score > 0:
+                score += 1
+            elif score < 0:
+                score -= 1
+
+        # محدود کردن امتیاز
+        score = max(-6, min(6, score))
+
+        signal = None
+
+        if score >= 3:
+            signal = "LONG"
+
+        elif score <= -3:
+            signal = "SHORT"
+
+        if signal is None:
+            continue
+
+        # ورود در کندل بعدی
+        entry_row = d.iloc[i + 1]
+        entry = float(entry_row["open"])
+
+        risk = max(
+            atr * 0.75,
+            atr * 0.5
+        )
+
+        if signal == "LONG":
+            longs += 1
+
+            stop_loss = entry - risk
+            take_profit = entry + (1.5 * risk)
+
+        else:
+            shorts += 1
+
+            stop_loss = entry + risk
+            take_profit = entry - (1.5 * risk)
+
+        result = "LOSS"
+        exit_price = float(
+            d.iloc[-1]["close"]
+        )
+
+        # بررسی کندل‌های بعدی
+        for j in range(i + 1, len(d)):
+
+            candle = d.iloc[j]
+
+            high = float(candle["high"])
+            low = float(candle["low"])
+
+            if signal == "LONG":
+
+                if low <= stop_loss:
+                    exit_price = stop_loss
+                    result = "LOSS"
+                    break
+
+                if high >= take_profit:
+                    exit_price = take_profit
+                    result = "WIN"
+                    break
+
+            else:
+
+                if high >= stop_loss:
+                    exit_price = stop_loss
+                    result = "LOSS"
+                    break
+
+                if low <= take_profit:
+                    exit_price = take_profit
+                    result = "WIN"
+                    break
+
+        if signal == "LONG":
+            r_multiple = (
+                exit_price - entry
+            ) / risk
+
+        else:
+            r_multiple = (
+                entry - exit_price
+            ) / risk
+
+        equity += r_multiple
+
+        peak_equity = max(
+            peak_equity,
+            equity
+        )
+
+        drawdown = peak_equity - equity
+
+        max_drawdown = max(
+            max_drawdown,
+            drawdown
+        )
+
+        if result == "WIN":
+            wins += 1
+        else:
+            losses += 1
+
+        trades.append({
+            "signal": signal,
+            "entry": round(entry, 8),
+            "exit": round(exit_price, 8),
+            "result": result,
+            "r": round(r_multiple, 2)
+        })
+
+    total_trades = wins + losses
+
+    win_rate = (
+        (wins / total_trades) * 100
+        if total_trades > 0
+        else 0
+    )
+
+    return {
+        "status": "ok",
+        "total_trades": total_trades,
+        "long_trades": longs,
+        "short_trades": shorts,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(win_rate, 2),
+        "total_r": round(equity, 2),
+        "max_drawdown_r": round(max_drawdown, 2),
+        "trades": trades
     }
+
+
+# =================================================
+# BACKTEST API
+# =================================================
+
+@app.get("/backtest")
+def run_backtest(
+    symbol: str = Query("BTCUSDT"),
+    interval: str = Query("1h")
+):
+
+    symbol = normalize_symbol(symbol)
+    interval = normalize_interval(interval)
+
+    df, pair = get_ohlc(
+        symbol,
+        interval
+    )
+
+    result = backtest_strategy(df)
+
+    result["symbol"] = symbol
+    result["pair"] = pair
+    result["interval"] = interval
+    result["data_source"] = "Kraken"
+
+    return result
 # =========================================================
 # HEALTH
 # =========================================================
