@@ -1400,7 +1400,15 @@ border:1px solid rgba(255,255,255,.08);
 
 <div class="grid">
 
-<div class="box">
+<div class="box"><div class="box">
+🎯 ناحیه ورود
+<br>
+<b>
+${data.entry_low != null && data.entry_high != null
+    ? formatNumber(data.entry_low) + " — " + formatNumber(data.entry_high)
+    : "-"}
+</b>
+</div>
 1 ساعت
 <br><br>
 <b>${data.mtf?.["1h"]?.signal || "-"}</b>
