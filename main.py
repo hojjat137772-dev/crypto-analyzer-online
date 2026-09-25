@@ -892,7 +892,7 @@ def analyze_market(
     result["pair"] = pair
 
     result["interval"] = interval
-
+result["mtf"] = get_mtf_analysis(symbol)
     result["data_source"] = "Kraken"
 
     return result
