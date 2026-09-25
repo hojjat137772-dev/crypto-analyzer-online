@@ -1299,7 +1299,53 @@ ${data.signal}
 
 </div>
 
+<div class="signal">
+${data.signal}
+</div>
 
+<div style="
+margin:18px 0;
+padding:18px;
+border-radius:22px;
+background:rgba(20,35,60,.75);
+border:1px solid rgba(255,255,255,.08);
+">
+
+<h2 style="margin-top:0;text-align:center;">
+📊 تحلیل چندتایم‌فریمی
+</h2>
+
+<div class="grid">
+
+<div class="box">
+1 ساعت
+<br><br>
+<b>${data.mtf?.["1h"]?.signal || "-"}</b>
+<br>
+${data.mtf?.["1h"]?.confidence ?? "-"}%
+</div>
+
+<div class="box">
+4 ساعت
+<br><br>
+<b>${data.mtf?.["4h"]?.signal || "-"}</b>
+<br>
+${data.mtf?.["4h"]?.confidence ?? "-"}%
+</div>
+
+<div class="box">
+1 روز
+<br><br>
+<b>${data.mtf?.["1d"]?.signal || "-"}</b>
+<br>
+${data.mtf?.["1d"]?.confidence ?? "-"}%
+</div>
+
+</div>
+
+</div>
+
+<div class="grid">
 <div class="grid">
 
 <div class="box">
