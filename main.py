@@ -670,9 +670,9 @@ else:
         "شرایط کافی برای ورود به معامله وجود ندارد."
     )
 
-# -----------------------
+# --------------------
 # CONFIDENCE
-# -----------------------
+# --------------------
 
 confidence = round(
     min(100, abs(score) / 5 * 100)
@@ -685,17 +685,11 @@ if signal == "LONG" and 50 < current_rsi < 70:
 elif signal == "SHORT" and 30 < current_rsi < 50:
     confidence += 5
 
-confidence = min(100, confidence)
-# Confidence: 0 تا 100
-confidence = round(
-    ((score + 5) / 10) * 100
-)
-
+# محدود کردن Confidence به 0 تا 100
 confidence = max(
     0,
     min(100, confidence)
 )
-
 # ------------------------
 # RISK / REWARD
 # ------------------------
