@@ -4,20 +4,29 @@ import requests
 import pandas as pd
 import math
 
-app = FastAPI(title="Crypto Analyzer Online", version="4.0.0")
+app = FastAPI(
+    title="Crypto Analyzer Online",
+    version="4.1.0"
+)
 
-KRAKEN = "https://api.kraken.com/0/public"
+KRAKEN_API = "https://api.kraken.com/0/public"
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "CryptoAnalyzerOnline/4.0"
+    "User-Agent": "CryptoAnalyzerOnline/4.1"
 })
+
+
+# =========================================================
+# TIMEFRAMES
+# =========================================================
 
 INTERVALS = {
     "1h": 60,
     "4h": 240,
     "1d": 1440,
     "1w": 10080,
+
     "1 ساعت": 60,
     "4 ساعت": 240,
     "1 روز": 1440,
@@ -25,98 +34,203 @@ INTERVALS = {
 }
 
 
+# =========================================================
+# SYMBOL
+# =========================================================
+
 def normalize_symbol(symbol):
     return (
-        str(symbol).strip().upper()
+        str(symbol)
+        .strip()
+        .upper()
         .replace("/", "")
         .replace("-", "")
+        .replace("_", "")
         .replace(" ", "")
     )
 
 
-def base_symbol(symbol):
+def normalize_interval(interval):
+    value = str(interval).strip().lower()
+
+    aliases = {
+        "1 ساعت": "1h",
+        "4 ساعت": "4h",
+        "1 روز": "1d",
+        "1 هفته": "1w"
+    }
+
+    return aliases.get(value, value)
+
+
+def get_base_symbol(symbol):
     s = normalize_symbol(symbol)
 
-    for q in ["USDT", "USDC", "USD", "BUSD"]:
-        if s.endswith(q) and len(s) > len(q):
-            return s[:-len(q)]
+    quotes = [
+        "USDT",
+        "USDC",
+        "BUSD",
+        "USD"
+    ]
+
+    for quote in quotes:
+        if s.endswith(quote) and len(s) > len(quote):
+            return s[:-len(quote)]
 
     return s
 
 
-def get_pairs():
-    try:
-        r = session.get(
-            f"{KRAKEN}/AssetPairs",
-            timeout=15
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data.get("result", {})
-    except Exception:
-        raise HTTPException(
-            502,
-            "دریافت فهرست ارزهای Kraken ناموفق بود."
-        )
+# =========================================================
+# KRAKEN PAIR
+# =========================================================
 
+def get_pair_candidates(symbol):
 
-def find_pair(symbol):
-    base = base_symbol(symbol)
+    base = get_base_symbol(symbol)
 
     if base == "BTC":
-        bases = {"XBT", "BTC"}
+        bases = ["XBT", "BTC"]
     else:
-        bases = {base}
-
-    pairs = get_pairs()
+        bases = [base]
 
     candidates = []
 
-    for key, p in pairs.items():
+    for b in bases:
+        candidates.extend([
+            b + "USDT",
+            b + "USD",
+            b + "USDC"
+        ])
 
-        altname = str(p.get("altname", "")).upper()
-        wsname = str(p.get("wsname", "")).upper()
+    return list(dict.fromkeys(candidates))
 
-        pair_text = altname + wsname
 
-        if any(
-            (b + "/USD") in pair_text or
-            (b + "/USDT") in pair_text or
-            (b + "USD") in pair_text or
-            (b + "USDT") in pair_text
-            for b in bases
-        ):
-            candidates.append(key)
+def get_asset_pairs():
 
-    if not candidates:
+    try:
+        response = session.get(
+            f"{KRAKEN_API}/AssetPairs",
+            timeout=15
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if data.get("error"):
+            return {}
+
+        return data.get("result", {})
+
+    except Exception:
+        return {}
+
+
+def find_kraken_pair(symbol):
+
+    candidates = get_pair_candidates(symbol)
+
+    # ابتدا مستقیماً جفت‌های رایج را امتحان می‌کنیم
+    for pair in candidates:
+
+        try:
+
+            response = session.get(
+                f"{KRAKEN_API}/OHLC",
+                params={
+                    "pair": pair,
+                    "interval": 60
+                },
+                timeout=10
+            )
+
+            if response.status_code != 200:
+                continue
+
+            data = response.json()
+
+            if not data.get("error"):
+
+                result = data.get("result", {})
+
+                if result:
+                    return pair
+
+        except Exception:
+            continue
+
+    # اگر نام مستقیم جواب نداد، AssetPairs را بررسی می‌کنیم
+    pairs = get_asset_pairs()
+
+    if not pairs:
+        return None
+
+    base = get_base_symbol(symbol)
+
+    if base == "BTC":
+        bases = {"BTC", "XBT"}
+    else:
+        bases = {base}
+
+    for key, info in pairs.items():
+
+        altname = str(
+            info.get("altname", "")
+        ).upper()
+
+        wsname = str(
+            info.get("wsname", "")
+        ).upper()
+
+        text = altname + " " + wsname
+
+        for b in bases:
+
+            if (
+                b + "USD" in text
+                or
+                b + "USDT" in text
+                or
+                b + "/USD" in text
+                or
+                b + "/USDT" in text
+            ):
+                return key
+
+    return None
+
+
+# =========================================================
+# OHLC DATA
+# =========================================================
+
+def get_ohlc(symbol, interval):
+
+    interval = normalize_interval(interval)
+
+    if interval not in INTERVALS:
+
+        raise HTTPException(
+            400,
+            "تایم‌فریم معتبر نیست. "
+            "از 1 ساعت، 4 ساعت، 1 روز یا 1 هفته استفاده کنید."
+        )
+
+    kraken_interval = INTERVALS[interval]
+
+    pair = find_kraken_pair(symbol)
+
+    if not pair:
+
         raise HTTPException(
             404,
             f"جفت معاملاتی {symbol} در Kraken پیدا نشد."
         )
 
-    # ترجیح USDT
-    for c in candidates:
-        if "USDT" in c.upper():
-            return c
-
-    return candidates[0]
-
-
-def get_ohlc(symbol, interval):
-
-    if interval not in INTERVALS:
-        raise HTTPException(
-            400,
-            "تایم‌فریم معتبر نیست."
-        )
-
-    kraken_interval = INTERVALS[interval]
-
-    pair = find_pair(symbol)
-
     try:
-        r = session.get(
-            f"{KRAKEN}/OHLC",
+
+        response = session.get(
+            f"{KRAKEN_API}/OHLC",
             params={
                 "pair": pair,
                 "interval": kraken_interval
@@ -124,20 +238,26 @@ def get_ohlc(symbol, interval):
             timeout=20
         )
 
-        r.raise_for_status()
+        response.raise_for_status()
 
-        data = r.json()
+        data = response.json()
 
-    except Exception:
+    except requests.RequestException:
+
         raise HTTPException(
             502,
-            "ارتباط با منبع داده بازار برقرار نشد."
+            "ارتباط با Kraken برقرار نشد."
         )
 
     if data.get("error"):
+
         raise HTTPException(
             400,
-            "Kraken داده‌ای برای این ارز برنگرداند."
+            "Kraken خطا برگرداند: "
+            + " | ".join(
+                str(x)
+                for x in data["error"]
+            )
         )
 
     result = data.get("result", {})
@@ -145,14 +265,16 @@ def get_ohlc(symbol, interval):
     rows = None
 
     for key, value in result.items():
+
         if key != "last":
             rows = value
             break
 
     if not rows:
+
         raise HTTPException(
             400,
-            "داده کافی برای تحلیل وجود ندارد."
+            "Kraken برای این ارز داده‌ای برنگرداند."
         )
 
     df = pd.DataFrame(
@@ -169,15 +291,18 @@ def get_ohlc(symbol, interval):
         ]
     )
 
-    for c in [
+    numeric_columns = [
         "open",
         "high",
         "low",
         "close",
         "volume"
-    ]:
-        df[c] = pd.to_numeric(
-            df[c],
+    ]
+
+    for column in numeric_columns:
+
+        df[column] = pd.to_numeric(
+            df[column],
             errors="coerce"
         )
 
@@ -187,9 +312,14 @@ def get_ohlc(symbol, interval):
         utc=True
     )
 
-    df = df.dropna().reset_index(drop=True)
+    df = (
+        df
+        .dropna()
+        .reset_index(drop=True)
+    )
 
     if len(df) < 60:
+
         raise HTTPException(
             400,
             "داده کافی برای تحلیل این ارز وجود ندارد."
@@ -198,71 +328,101 @@ def get_ohlc(symbol, interval):
     return df, pair
 
 
-def ema(s, n):
-    return s.ewm(
-        span=n,
+# =========================================================
+# INDICATORS
+# =========================================================
+
+def ema(series, period):
+
+    return series.ewm(
+        span=period,
         adjust=False
     ).mean()
 
 
-def rsi(s, n=14):
+def rsi(series, period=14):
 
-    delta = s.diff()
+    delta = series.diff()
 
     gain = delta.clip(lower=0)
+
     loss = -delta.clip(upper=0)
 
-    ag = gain.ewm(
-        alpha=1 / n,
+    avg_gain = gain.ewm(
+        alpha=1 / period,
         adjust=False,
-        min_periods=n
+        min_periods=period
     ).mean()
 
-    al = loss.ewm(
-        alpha=1 / n,
+    avg_loss = loss.ewm(
+        alpha=1 / period,
         adjust=False,
-        min_periods=n
+        min_periods=period
     ).mean()
 
-    rs = ag / al.replace(
+    rs = avg_gain / avg_loss.replace(
         0,
         float("nan")
     )
 
-    return (
-        100 - 100 / (1 + rs)
-    ).fillna(50)
+    result = 100 - (
+        100 / (1 + rs)
+    )
+
+    return result.fillna(50)
 
 
-def atr(df, n=14):
+def atr(df, period=14):
 
-    pc = df["close"].shift(1)
+    previous_close = df["close"].shift(1)
 
-    tr = pd.concat(
+    true_range = pd.concat(
         [
             df["high"] - df["low"],
-            (df["high"] - pc).abs(),
-            (df["low"] - pc).abs()
+
+            (
+                df["high"] -
+                previous_close
+            ).abs(),
+
+            (
+                df["low"] -
+                previous_close
+            ).abs()
         ],
         axis=1
     ).max(axis=1)
 
-    return tr.ewm(
-        alpha=1 / n,
+    return true_range.ewm(
+        alpha=1 / period,
         adjust=False,
-        min_periods=n
+        min_periods=period
     ).mean()
 
 
-def indicators(df):
+def add_indicators(df):
 
     d = df.copy()
 
-    d["ema20"] = ema(d["close"], 20)
-    d["ema50"] = ema(d["close"], 50)
-    d["ema200"] = ema(d["close"], 200)
+    d["ema20"] = ema(
+        d["close"],
+        20
+    )
 
-    d["rsi"] = rsi(d["close"])
+    d["ema50"] = ema(
+        d["close"],
+        50
+    )
+
+    d["ema200"] = ema(
+        d["close"],
+        200
+    )
+
+    d["rsi"] = rsi(
+        d["close"],
+        14
+    )
 
     d["macd"] = (
         ema(d["close"], 12)
@@ -281,64 +441,156 @@ def indicators(df):
         d["macd_signal"]
     )
 
-    d["atr"] = atr(d)
+    d["atr"] = atr(
+        d,
+        14
+    )
 
-    return d.dropna().reset_index(
-        drop=True
+    return (
+        d
+        .dropna()
+        .reset_index(drop=True)
     )
 
 
+# =========================================================
+# ANALYSIS
+# =========================================================
+
 def analyze(df):
 
-    d = indicators(df)
+    d = add_indicators(df)
+
+    if len(d) < 10:
+
+        raise HTTPException(
+            400,
+            "داده کافی برای تحلیل وجود ندارد."
+        )
 
     x = d.iloc[-1]
 
     price = float(x["close"])
-    a = float(x["atr"])
-    rv = float(x["rsi"])
+    current_atr = float(x["atr"])
+    current_rsi = float(x["rsi"])
 
     score = 0
+
     reasons = []
 
+    # -------------------------
+    # EMA20
+    # -------------------------
+
     if price > x["ema20"]:
+
         score += 1
-        reasons.append("قیمت بالای EMA20 است.")
+
+        reasons.append(
+            "قیمت بالای EMA20 است."
+        )
+
     else:
+
         score -= 1
-        reasons.append("قیمت زیر EMA20 است.")
+
+        reasons.append(
+            "قیمت زیر EMA20 است."
+        )
+
+    # -------------------------
+    # EMA50
+    # -------------------------
 
     if x["ema20"] > x["ema50"]:
+
         score += 1
-        reasons.append("EMA20 بالای EMA50 است.")
+
+        reasons.append(
+            "EMA20 بالای EMA50 است."
+        )
+
     else:
+
         score -= 1
-        reasons.append("EMA20 زیر EMA50 است.")
+
+        reasons.append(
+            "EMA20 زیر EMA50 است."
+        )
+
+    # -------------------------
+    # EMA200
+    # -------------------------
 
     if x["ema50"] > x["ema200"]:
-        score += 1
-        reasons.append("EMA50 بالای EMA200 است.")
-    else:
-        score -= 1
-        reasons.append("EMA50 زیر EMA200 است.")
 
-    if rv >= 55:
         score += 1
-        reasons.append("RSI متمایل به قدرت خریداران است.")
-    elif rv <= 45:
-        score -= 1
-        reasons.append("RSI متمایل به قدرت فروشندگان است.")
+
+        reasons.append(
+            "EMA50 بالای EMA200 است."
+        )
+
     else:
-        reasons.append("RSI در محدوده خنثی است.")
+
+        score -= 1
+
+        reasons.append(
+            "EMA50 زیر EMA200 است."
+        )
+
+    # -------------------------
+    # RSI
+    # -------------------------
+
+    if current_rsi >= 55:
+
+        score += 1
+
+        reasons.append(
+            "RSI متمایل به قدرت خریداران است."
+        )
+
+    elif current_rsi <= 45:
+
+        score -= 1
+
+        reasons.append(
+            "RSI متمایل به قدرت فروشندگان است."
+        )
+
+    else:
+
+        reasons.append(
+            "RSI در محدوده خنثی است."
+        )
+
+    # -------------------------
+    # MACD
+    # -------------------------
 
     if x["macd_hist"] > 0:
-        score += 1
-        reasons.append("MACD مثبت است.")
-    else:
-        score -= 1
-        reasons.append("MACD منفی است.")
 
-    recent = d.tail(100)
+        score += 1
+
+        reasons.append(
+            "MACD مثبت است."
+        )
+
+    else:
+
+        score -= 1
+
+        reasons.append(
+            "MACD منفی است."
+        )
+
+    # -------------------------
+    # Support / Resistance
+    # -------------------------
+
+    recent = d.tail(
+        min(100, len(d))
+    )
 
     support = float(
         recent["low"].min()
@@ -348,23 +600,31 @@ def analyze(df):
         recent["high"].max()
     )
 
+    # -------------------------
+    # Signal
+    # -------------------------
+
     if score >= 3:
 
         signal = "LONG"
 
         entry = price
 
-        sl = min(
+        stop_loss = min(
             support,
-            price - 1.5 * a
+            price - 1.5 * current_atr
         )
 
-        if sl >= entry:
-            sl = entry - 1.5 * a
+        if stop_loss >= entry:
+
+            stop_loss = (
+                entry -
+                1.5 * current_atr
+            )
 
         risk = max(
-            entry - sl,
-            a * 0.5
+            entry - stop_loss,
+            current_atr * 0.5
         )
 
         tp1 = entry + 1.5 * risk
@@ -377,17 +637,21 @@ def analyze(df):
 
         entry = price
 
-        sl = max(
+        stop_loss = max(
             resistance,
-            price + 1.5 * a
+            price + 1.5 * current_atr
         )
 
-        if sl <= entry:
-            sl = entry + 1.5 * a
+        if stop_loss <= entry:
+
+            stop_loss = (
+                entry +
+                1.5 * current_atr
+            )
 
         risk = max(
-            sl - entry,
-            a * 0.5
+            stop_loss - entry,
+            current_atr * 0.5
         )
 
         tp1 = entry - 1.5 * risk
@@ -399,58 +663,114 @@ def analyze(df):
         signal = "NO TRADE"
 
         entry = price
-        sl = None
+
+        stop_loss = None
         tp1 = None
         tp2 = None
         tp3 = None
 
-    def rnd(v):
+    # -------------------------
+    # Rounding
+    # -------------------------
 
-        if v is None:
+    def rnd(value):
+
+        if value is None:
             return None
 
         try:
-            v = float(v)
 
-            if not math.isfinite(v):
+            value = float(value)
+
+            if not math.isfinite(value):
                 return None
 
-            return round(v, 8)
+            return round(
+                value,
+                8
+            )
 
-        except:
+        except Exception:
+
             return None
 
     return {
+
         "signal": signal,
+
         "price": rnd(price),
+
         "entry": rnd(entry),
-        "stop_loss": rnd(sl),
+
+        "stop_loss": rnd(stop_loss),
+
         "take_profit_1": rnd(tp1),
+
         "take_profit_2": rnd(tp2),
+
         "take_profit_3": rnd(tp3),
-        "rsi": round(rv, 2),
-        "ema20": rnd(x["ema20"]),
-        "ema50": rnd(x["ema50"]),
-        "ema200": rnd(x["ema200"]),
-        "macd": rnd(x["macd"]),
-        "macd_signal": rnd(x["macd_signal"]),
-        "atr": rnd(a),
-        "support": rnd(support),
-        "resistance": rnd(resistance),
+
+        "rsi": round(
+            current_rsi,
+            2
+        ),
+
+        "ema20": rnd(
+            x["ema20"]
+        ),
+
+        "ema50": rnd(
+            x["ema50"]
+        ),
+
+        "ema200": rnd(
+            x["ema200"]
+        ),
+
+        "macd": rnd(
+            x["macd"]
+        ),
+
+        "macd_signal": rnd(
+            x["macd_signal"]
+        ),
+
+        "atr": rnd(
+            current_atr
+        ),
+
+        "support": rnd(
+            support
+        ),
+
+        "resistance": rnd(
+            resistance
+        ),
+
         "score": score,
+
         "reasons": reasons
     }
 
+
+# =========================================================
+# HEALTH
+# =========================================================
 
 @app.get("/health")
 def health():
 
     return {
         "status": "ok",
-        "version": "4.0.0",
+        "service": "Crypto Analyzer Online",
+        "version": "4.1.0",
         "data_source": "Kraken"
     }
 
+
+# =========================================================
+# ANALYZE API
+# =========================================================
 
 @app.get("/analyze")
 def analyze_market(
@@ -458,9 +778,13 @@ def analyze_market(
     interval: str = Query("1h")
 ):
 
-    symbol = normalize_symbol(symbol)
+    symbol = normalize_symbol(
+        symbol
+    )
 
-    interval = normalize_interval(interval)
+    interval = normalize_interval(
+        interval
+    )
 
     df, pair = get_ohlc(
         symbol,
@@ -470,15 +794,23 @@ def analyze_market(
     result = analyze(df)
 
     result["symbol"] = symbol
+
     result["pair"] = pair
+
     result["interval"] = interval
+
     result["data_source"] = "Kraken"
 
     return result
 
 
+# =========================================================
+# FRONTEND
+# =========================================================
+
 HTML = """
 <!doctype html>
+
 <html lang="fa" dir="rtl">
 
 <head>
@@ -490,114 +822,219 @@ name="viewport"
 content="width=device-width,initial-scale=1"
 >
 
-<title>Crypto Analyzer Online</title>
+<title>
+Crypto Analyzer Online
+</title>
 
 <style>
 
 *{
-box-sizing:border-box
+box-sizing:border-box;
 }
 
 body{
+
 margin:0;
+
+min-height:100vh;
+
 background:
-linear-gradient(
-180deg,
-#0b1730,
+radial-gradient(
+circle at top,
+#172554,
+#07101f 55%,
 #020617
 );
+
 color:white;
-font-family:Tahoma,Arial;
-min-height:100vh;
+
+font-family:
+Tahoma,
+Arial,
+sans-serif;
+
 }
 
 .wrap{
+
 max-width:800px;
+
 margin:auto;
+
 padding:25px 16px;
+
 }
 
 .card{
-background:#111d32;
+
+background:
+rgba(17,29,50,.95);
+
+border:
+1px solid rgba(255,255,255,.08);
+
 padding:28px;
+
 border-radius:28px;
-box-shadow:0 20px 60px #0008;
+
+box-shadow:
+0 20px 60px rgba(0,0,0,.4);
+
 }
 
 h1{
+
 direction:ltr;
+
 text-align:left;
+
+font-size:30px;
+
+margin-top:0;
+
 }
 
 .sub{
+
 font-size:20px;
+
 color:#cbd5e1;
-margin-bottom:25px;
+
+margin-bottom:28px;
+
 }
 
 label{
+
 display:block;
+
 margin-top:15px;
-margin-bottom:5px;
+
+margin-bottom:6px;
+
+color:#cbd5e1;
+
 }
 
-input,select,button{
+input,
+select,
+button{
+
 width:100%;
+
 padding:16px;
+
 border:0;
+
 border-radius:14px;
+
 font-size:17px;
+
 margin:7px 0;
+
 }
 
-input,select{
+input,
+select{
+
 background:#081426;
+
 color:white;
-border:1px solid #263751;
+
+border:
+1px solid #263751;
+
 }
 
 button{
+
 background:#16a34a;
+
 color:white;
+
 font-weight:bold;
+
 cursor:pointer;
+
 }
 
 button:disabled{
+
 opacity:.6;
+
+cursor:wait;
+
 }
 
 .result{
+
 margin-top:20px;
+
 background:#050d1b;
-padding:18px;
+
+padding:20px;
+
 border-radius:18px;
+
 line-height:2;
+
 }
 
 .grid{
+
 display:grid;
-grid-template-columns:1fr 1fr;
+
+grid-template-columns:
+1fr 1fr;
+
 gap:10px;
+
 }
 
 .box{
+
 background:#17243a;
+
 padding:12px;
-border-radius:12px;
+
+border-radius:13px;
+
 }
 
 .signal{
-font-size:28px;
-text-align:center;
+
+font-size:30px;
+
 font-weight:bold;
+
+text-align:center;
+
+padding:12px;
+
 margin-bottom:15px;
+
 }
 
-.small{
+.info{
+
 color:#94a3b8;
+
 font-size:13px;
-margin-top:15px;
+
+margin-top:18px;
+
+}
+
+@media(max-width:600px){
+
+h1{
+font-size:24px;
+}
+
+.grid{
+grid-template-columns:1fr 1fr;
+}
+
 }
 
 </style>
@@ -618,7 +1055,9 @@ margin-top:15px;
 تحلیل آنلاین بازار ارز دیجیتال
 </div>
 
-<label>نماد ارز</label>
+<label>
+نماد ارز
+</label>
 
 <input
 id="symbol"
@@ -626,7 +1065,9 @@ value="BTCUSDT"
 placeholder="مثلاً BTCUSDT"
 />
 
-<label>تایم‌فریم</label>
+<label>
+تایم‌فریم
+</label>
 
 <select id="interval">
 
@@ -650,34 +1091,46 @@ placeholder="مثلاً BTCUSDT"
 
 <button
 id="btn"
-onclick="run()"
+onclick="runAnalysis()"
 >
 🔍 تحلیل بازار
 </button>
 
 <div id="result">
+
 آماده تحلیل...
-</div>
 
 </div>
 
 </div>
+
+</div>
+
 
 <script>
 
-const f = v =>
-v == null
-?
-"-"
-:
-Number(v).toLocaleString(
+function formatNumber(value){
+
+if(
+value === null ||
+value === undefined
+){
+
+return "-";
+
+}
+
+return Number(value).toLocaleString(
 "en-US",
 {
 maximumFractionDigits:8
 }
 );
 
-async function run(){
+}
+
+
+async function runAnalysis(){
 
 const symbol =
 document
@@ -691,126 +1144,251 @@ document
 .getElementById("interval")
 .value;
 
-const btn =
+const button =
 document.getElementById("btn");
 
-const out =
+const result =
 document.getElementById("result");
 
-btn.disabled=true;
+button.disabled = true;
 
-btn.textContent=
+button.textContent =
 "⏳ در حال تحلیل...";
 
-out.textContent=
-"دریافت داده‌های بازار...";
+result.innerHTML =
+"در حال دریافت داده‌های بازار...";
+
 
 try{
 
+const url =
+"/analyze?symbol=" +
+encodeURIComponent(symbol) +
+"&interval=" +
+encodeURIComponent(interval);
+
 const response =
-await fetch(
-`/analyze?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`
+await fetch(url);
+
+let data;
+
+try{
+
+data =
+await response.json();
+
+}
+catch(error){
+
+throw new Error(
+"پاسخ معتبر از سرور دریافت نشد."
 );
 
-const data =
-await response.json();
+}
+
 
 if(!response.ok){
 
 throw new Error(
 data.detail ||
-"خطا در دریافت اطلاعات"
+"خطای نامشخص در سرور"
 );
 
 }
 
-out.innerHTML=`
+
+result.innerHTML = `
 
 <div class="signal">
+
 ${data.signal}
+
 </div>
+
 
 <div class="grid">
 
 <div class="box">
-قیمت<br>
-<b>${f(data.price)}</b>
-</div>
 
-<div class="box">
-RSI<br>
-<b>${f(data.rsi)}</b>
-</div>
-
-<div class="box">
-ورود<br>
-<b>${f(data.entry)}</b>
-</div>
-
-<div class="box">
-حد ضرر<br>
-<b>${f(data.stop_loss)}</b>
-</div>
-
-<div class="box">
-TP1<br>
-<b>${f(data.take_profit_1)}</b>
-</div>
-
-<div class="box">
-TP2<br>
-<b>${f(data.take_profit_2)}</b>
-</div>
-
-<div class="box">
-TP3<br>
-<b>${f(data.take_profit_3)}</b>
-</div>
-
-<div class="box">
-امتیاز<br>
-<b>${data.score}</b>
-</div>
-
-<div class="box">
-حمایت<br>
-<b>${f(data.support)}</b>
-</div>
-
-<div class="box">
-مقاومت<br>
-<b>${f(data.resistance)}</b>
-</div>
-
-</div>
+قیمت
 
 <br>
 
-<b>دلایل تحلیل:</b>
+<b>
+${formatNumber(data.price)}
+</b>
+
+</div>
+
+
+<div class="box">
+
+RSI
+
+<br>
+
+<b>
+${formatNumber(data.rsi)}
+</b>
+
+</div>
+
+
+<div class="box">
+
+ورود
+
+<br>
+
+<b>
+${formatNumber(data.entry)}
+</b>
+
+</div>
+
+
+<div class="box">
+
+حد ضرر
+
+<br>
+
+<b>
+${formatNumber(data.stop_loss)}
+</b>
+
+</div>
+
+
+<div class="box">
+
+TP1
+
+<br>
+
+<b>
+${formatNumber(data.take_profit_1)}
+</b>
+
+</div>
+
+
+<div class="box">
+
+TP2
+
+<br>
+
+<b>
+${formatNumber(data.take_profit_2)}
+</b>
+
+</div>
+
+
+<div class="box">
+
+TP3
+
+<br>
+
+<b>
+${formatNumber(data.take_profit_3)}
+</b>
+
+</div>
+
+
+<div class="box">
+
+امتیاز
+
+<br>
+
+<b>
+${data.score}
+</b>
+
+</div>
+
+
+<div class="box">
+
+حمایت
+
+<br>
+
+<b>
+${formatNumber(data.support)}
+</b>
+
+</div>
+
+
+<div class="box">
+
+مقاومت
+
+<br>
+
+<b>
+${formatNumber(data.resistance)}
+</b>
+
+</div>
+
+</div>
+
+
+<br>
+
+
+<b>
+دلایل تحلیل:
+</b>
 
 <br>
 
 ${data.reasons.join("<br>")}
 
-<div class="small">
-منبع داده: Kraken<br>
-این تحلیل تضمین سود یا توصیه قطعی معامله نیست.
+
+<div class="info">
+
+منبع داده:
+Kraken
+
+<br>
+
+جفت:
+${data.pair}
+
+<br><br>
+
+این خروجی تحلیل تکنیکال است و
+تضمین سود یا توصیه قطعی معامله نیست.
+
 </div>
 
 `;
 
-}catch(e){
+}
 
-out.innerHTML=
+catch(error){
+
+result.innerHTML =
 "❌ خطا: " +
-e.message;
+error.message;
 
 }
 
-btn.disabled=false;
+finally{
 
-btn.textContent=
+button.disabled = false;
+
+button.textContent =
 "🔍 تحلیل بازار";
+
+}
 
 }
 
@@ -821,6 +1399,10 @@ btn.textContent=
 </html>
 """
 
+
+# =========================================================
+# HOME
+# =========================================================
 
 @app.get(
     "/",
