@@ -474,8 +474,7 @@ def analyze(df):
     current_atr = float(x["atr"])
     current_rsi = float(x["rsi"])
 
-    score = 0
-
+        score = 0
     reasons = []
 
     # -------------------------
@@ -483,192 +482,167 @@ def analyze(df):
     # -------------------------
 
     if price > x["ema20"]:
-
         score += 1
-
-        reasons.append(
-            "قیمت بالای EMA20 است."
-        )
-
+        reasons.append("قیمت بالای EMA20 است.")
     else:
-
         score -= 1
-
-        reasons.append(
-            "قیمت زیر EMA20 است."
-        )
+        reasons.append("قیمت زیر EMA20 است.")
 
     # -------------------------
-    # EMA50
+    # EMA20 / EMA50
     # -------------------------
 
     if x["ema20"] > x["ema50"]:
-
         score += 1
-
-        reasons.append(
-            "EMA20 بالای EMA50 است."
-        )
-
+        reasons.append("EMA20 بالای EMA50 است.")
     else:
-
         score -= 1
-
-        reasons.append(
-            "EMA20 زیر EMA50 است."
-        )
+        reasons.append("EMA20 زیر EMA50 است.")
 
     # -------------------------
-    # EMA200
+    # EMA50 / EMA200
     # -------------------------
 
     if x["ema50"] > x["ema200"]:
-
         score += 1
-
-        reasons.append(
-            "EMA50 بالای EMA200 است."
-        )
-
+        reasons.append("EMA50 بالای EMA200 است.")
     else:
-
         score -= 1
-
-        reasons.append(
-            "EMA50 زیر EMA200 است."
-        )
+        reasons.append("EMA50 زیر EMA200 است.")
 
     # -------------------------
     # RSI
     # -------------------------
 
     if current_rsi >= 55:
-
         score += 1
-
-        reasons.append(
-            "RSI متمایل به قدرت خریداران است."
-        )
+        reasons.append("RSI نشان‌دهنده قدرت خریداران است.")
 
     elif current_rsi <= 45:
-
         score -= 1
-
-        reasons.append(
-            "RSI متمایل به قدرت فروشندگان است."
-        )
+        reasons.append("RSI نشان‌دهنده قدرت فروشندگان است.")
 
     else:
-
-        reasons.append(
-            "RSI در محدوده خنثی است."
-        )
+        reasons.append("RSI در محدوده خنثی است.")
 
     # -------------------------
     # MACD
     # -------------------------
 
     if x["macd_hist"] > 0:
-
         score += 1
-
-        reasons.append(
-            "MACD مثبت است."
-        )
-
+        reasons.append("MACD مثبت است.")
     else:
-
         score -= 1
+        reasons.append("MACD منفی است.")
 
-        reasons.append(
-            "MACD منفی است."
-        )
+# -------------------------
+# Signal
+# -------------------------
 
-    # -------------------------
-    # Support / Resistance
-    # -------------------------
+if score >= 3:
 
-    recent = d.tail(
-        min(100, len(d))
+    signal = "LONG"
+    entry = price
+
+    stop_loss = min(
+        support,
+        price - 1.5 * current_atr
     )
 
-    support = float(
-        recent["low"].min()
+    if stop_loss >= entry:
+        stop_loss = entry - (1.5 * current_atr)
+
+    risk = max(
+        entry - stop_loss,
+        current_atr * 0.5
     )
 
-    resistance = float(
-        recent["high"].max()
+    tp1 = entry + 1.5 * risk
+    tp2 = entry + 2.5 * risk
+    tp3 = entry + 3.5 * risk
+
+    reasons.append(
+        "مجموع شرایط برای ورود LONG مناسب است."
+    )
+
+
+elif score <= -3:
+
+    signal = "SHORT"
+    entry = price
+
+    stop_loss = max(
+        resistance,
+        price + 1.5 * current_atr
+    )
+
+    if stop_loss <= entry:
+        stop_loss = entry + (1.5 * current_atr)
+
+    risk = max(
+        stop_loss - entry,
+        current_atr * 0.5
+    )
+
+    tp1 = entry - 1.5 * risk
+    tp2 = entry - 2.5 * risk
+    tp3 = entry - 3.5 * risk
+
+    reasons.append(
+        "مجموع شرایط برای ورود SHORT مناسب است."
+    )
+
+
+else:
+
+    signal = "NO TRADE"
+    entry = price
+
+    stop_loss = None
+    tp1 = None
+    tp2 = None
+    tp3 = None
+
+    risk = None
+
+    reasons.append(
+        "شرایط فعلی برای ورود قدرتمند کافی نیست."
+    )
+    # -------------------------
+    # Confidence 0 - 100
+    # -------------------------
+
+    confidence = round(
+        ((score + 5) / 10) * 100
+    )
+
+    confidence = max(
+        0,
+        min(100, confidence)
     )
 
     # -------------------------
-    # Signal
+    # Risk / Reward
     # -------------------------
 
-    if score >= 3:
+    rr1 = None
+    rr2 = None
+    rr3 = None
 
-        signal = "LONG"
+    if signal == "LONG" and risk and risk > 0:
 
-        entry = price
+        rr1 = round((tp1 - entry) / risk, 2)
+        rr2 = round((tp2 - entry) / risk, 2)
+        rr3 = round((tp3 - entry) / risk, 2)
 
-        stop_loss = min(
-            support,
-            price - 1.5 * current_atr
-        )
+    elif signal == "SHORT" and risk and risk > 0:
 
-        if stop_loss >= entry:
+        rr1 = round((entry - tp1) / risk, 2)
+        rr2 = round((entry - tp2) / risk, 2)
+        rr3 = round((entry - tp3) / risk, 2)
 
-            stop_loss = (
-                entry -
-                1.5 * current_atr
-            )
-
-        risk = max(
-            entry - stop_loss,
-            current_atr * 0.5
-        )
-
-        tp1 = entry + 1.5 * risk
-        tp2 = entry + 2.5 * risk
-        tp3 = entry + 3.5 * risk
-
-    elif score <= -3:
-
-        signal = "SHORT"
-
-        entry = price
-
-        stop_loss = max(
-            resistance,
-            price + 1.5 * current_atr
-        )
-
-        if stop_loss <= entry:
-
-            stop_loss = (
-                entry +
-                1.5 * current_atr
-            )
-
-        risk = max(
-            stop_loss - entry,
-            current_atr * 0.5
-        )
-
-        tp1 = entry - 1.5 * risk
-        tp2 = entry - 2.5 * risk
-        tp3 = entry - 3.5 * risk
-
-    else:
-
-        signal = "NO TRADE"
-
-        entry = price
-
-        stop_loss = None
-        tp1 = None
-        tp2 = None
-        tp3 = None
-
+    
     # -------------------------
     # Rounding
     # -------------------------
