@@ -546,20 +546,38 @@ else:
 # محدود کردن امتیاز
 score = max(-6, min(6, score))
     
-# -------------------------
-# Signal
-# -------------------------
+# -----------------------
+# SMART SIGNAL ENGINE
+# -----------------------
+
+signal = "NO TRADE"
+entry = price
+
+stop_loss = None
+tp1 = None
+tp2 = None
+tp3 = None
+risk = None
+
+# -----------------------
+# LONG
+# -----------------------
 
 if score >= 3:
 
     signal = "LONG"
     entry = price
 
-    stop_loss = min(
-        support,
-        price - 1.5 * current_atr
-    )
+    # حد ضرر ترکیبی:
+    # حمایت + ATR
+    atr_stop = price - (1.5 * current_atr)
 
+    if support is not None:
+        stop_loss = min(support, atr_stop)
+    else:
+        stop_loss = atr_stop
+
+    # جلوگیری از حد ضرر نامعتبر
     if stop_loss >= entry:
         stop_loss = entry - (1.5 * current_atr)
 
@@ -568,25 +586,44 @@ if score >= 3:
         current_atr * 0.5
     )
 
-    tp1 = entry + 1.5 * risk
-    tp2 = entry + 2.5 * risk
-    tp3 = entry + 3.5 * risk
+    # اهداف اولیه
+    raw_tp1 = entry + (1.5 * risk)
+    raw_tp2 = entry + (2.5 * risk)
+    raw_tp3 = entry + (3.5 * risk)
+
+    # استفاده از مقاومت در هدف اول، اگر معتبر باشد
+    if resistance is not None and resistance > entry:
+        tp1 = resistance
+    else:
+        tp1 = raw_tp1
+
+    # جلوگیری از نزدیک بودن TP2 و TP3
+    tp2 = max(raw_tp2, tp1 + risk)
+    tp3 = max(raw_tp3, tp2 + risk)
 
     reasons.append(
-        "مجموع شرایط برای ورود LONG مناسب است."
+        "مجموع شرایط تکنیکال برای LONG تأیید شده است."
     )
 
+# -----------------------
+# SHORT
+# -----------------------
 
 elif score <= -3:
 
     signal = "SHORT"
     entry = price
 
-    stop_loss = max(
-        resistance,
-        price + 1.5 * current_atr
-    )
+    # حد ضرر ترکیبی:
+    # مقاومت + ATR
+    atr_stop = price + (1.5 * current_atr)
 
+    if resistance is not None:
+        stop_loss = max(resistance, atr_stop)
+    else:
+        stop_loss = atr_stop
+
+    # جلوگیری از حد ضرر نامعتبر
     if stop_loss <= entry:
         stop_loss = entry + (1.5 * current_atr)
 
@@ -595,16 +632,31 @@ elif score <= -3:
         current_atr * 0.5
     )
 
-    tp1 = entry - 1.5 * risk
-    tp2 = entry - 2.5 * risk
-    tp3 = entry - 3.5 * risk
+    # اهداف اولیه
+    raw_tp1 = entry - (1.5 * risk)
+    raw_tp2 = entry - (2.5 * risk)
+    raw_tp3 = entry - (3.5 * risk)
+
+    # استفاده از حمایت در هدف اول، اگر معتبر باشد
+    if support is not None and support < entry:
+        tp1 = support
+    else:
+        tp1 = raw_tp1
+
+    # جلوگیری از نزدیک بودن TP2 و TP3
+    tp2 = min(raw_tp2, tp1 - risk)
+    tp3 = min(raw_tp3, tp2 - risk)
 
     reasons.append(
-        "مجموع شرایط برای ورود SHORT مناسب است."
+        "مجموع شرایط تکنیکال برای SHORT تأیید شده است."
     )
 
+# -----------------------
+# NO TRADE
+# -----------------------
 
 else:
+
     signal = "NO TRADE"
     entry = price
 
@@ -617,7 +669,23 @@ else:
     reasons.append(
         "شرایط کافی برای ورود به معامله وجود ندارد."
     )
-    
+
+# -----------------------
+# CONFIDENCE
+# -----------------------
+
+confidence = round(
+    min(100, abs(score) / 5 * 100)
+)
+
+# تقویت اعتماد بر اساس RSI
+if signal == "LONG" and 50 < current_rsi < 70:
+    confidence += 5
+
+elif signal == "SHORT" and 30 < current_rsi < 50:
+    confidence += 5
+
+confidence = min(100, confidence)
 # Confidence: 0 تا 100
 confidence = round(
     ((score + 5) / 10) * 100
