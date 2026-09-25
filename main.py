@@ -481,69 +481,71 @@ def analyze(df):
     price = float(x["close"])
     current_atr = float(x["atr"])
     current_rsi = float(x["rsi"])
+score = 0
+reasons = []
 
-        score = 0
-    reasons = []
+# -------------------------
+# SMART SCORING ENGINE
+# -------------------------
 
-    # -------------------------
-    # EMA20
-    # -------------------------
+# EMA20 / Price
+if price > x["ema20"]:
+    score += 1
+    reasons.append("قیمت بالای EMA20 است.")
+else:
+    score -= 1
+    reasons.append("قیمت زیر EMA20 است.")
 
-    if price > x["ema20"]:
+# EMA20 / EMA50
+if x["ema20"] > x["ema50"]:
+    score += 1
+    reasons.append("EMA20 بالای EMA50 است.")
+else:
+    score -= 1
+    reasons.append("EMA20 زیر EMA50 است.")
+
+# EMA50 / EMA200
+if x["ema50"] > x["ema200"]:
+    score += 1
+    reasons.append("EMA50 بالای EMA200 است.")
+else:
+    score -= 1
+    reasons.append("EMA50 زیر EMA200 است.")
+
+# RSI
+if current_rsi >= 60:
+    score += 1
+    reasons.append("RSI قدرت خریداران را تأیید می‌کند.")
+elif current_rsi <= 40:
+    score -= 1
+    reasons.append("RSI قدرت فروشندگان را تأیید می‌کند.")
+else:
+    reasons.append("RSI در محدوده خنثی است.")
+
+# MACD
+if x["macd_hist"] > 0:
+    score += 1
+    reasons.append("MACD مثبت است.")
+else:
+    score -= 1
+    reasons.append("MACD منفی است.")
+
+# Volume confirmation
+volume_ratio = float(x.get("volume_ratio", 1))
+
+if volume_ratio >= 1.20:
+    if score > 0:
         score += 1
-        reasons.append("قیمت بالای EMA20 است.")
-    else:
+        reasons.append("حجم معاملات ورود قدرت را تأیید می‌کند.")
+    elif score < 0:
         score -= 1
-        reasons.append("قیمت زیر EMA20 است.")
+        reasons.append("حجم معاملات فشار فروش را تأیید می‌کند.")
+else:
+    reasons.append("حجم معاملات تأیید قدرتمندی نمی‌دهد.")
 
-    # -------------------------
-    # EMA20 / EMA50
-    # -------------------------
-
-    if x["ema20"] > x["ema50"]:
-        score += 1
-        reasons.append("EMA20 بالای EMA50 است.")
-    else:
-        score -= 1
-        reasons.append("EMA20 زیر EMA50 است.")
-
-    # -------------------------
-    # EMA50 / EMA200
-    # -------------------------
-
-    if x["ema50"] > x["ema200"]:
-        score += 1
-        reasons.append("EMA50 بالای EMA200 است.")
-    else:
-        score -= 1
-        reasons.append("EMA50 زیر EMA200 است.")
-
-    # -------------------------
-    # RSI
-    # -------------------------
-
-    if current_rsi >= 55:
-        score += 1
-        reasons.append("RSI نشان‌دهنده قدرت خریداران است.")
-
-    elif current_rsi <= 45:
-        score -= 1
-        reasons.append("RSI نشان‌دهنده قدرت فروشندگان است.")
-
-    else:
-        reasons.append("RSI در محدوده خنثی است.")
-
-    # -------------------------
-    # MACD
-    # -------------------------
-
-    if x["macd_hist"] > 0:
-        score += 1
-        reasons.append("MACD مثبت است.")
-    else:
-        score -= 1
-        reasons.append("MACD منفی است.")
-
+# محدود کردن امتیاز
+score = max(-6, min(6, score))
+    
 # -------------------------
 # Signal
 # -------------------------
