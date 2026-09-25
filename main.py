@@ -1348,13 +1348,14 @@ ${formatNumber(data.confidence)}%
 </div>
 
 <div class="box">
+<div class="box">
 
 R/R - TP1
 
 <br>
 
 <b>
-${formatNumber(data.risk_reward_1)}
+${formatNumber(data.rr1)}
 </b>
 
 </div>
@@ -1366,7 +1367,7 @@ R/R - TP2
 <br>
 
 <b>
-${formatNumber(data.risk_reward_2)}
+${formatNumber(data.rr2)}
 </b>
 
 </div>
@@ -1378,7 +1379,7 @@ R/R - TP3
 <br>
 
 <b>
-${formatNumber(data.risk_reward_3)}
+${formatNumber(data.rr3)}
 </b>
 
 </div>
