@@ -605,7 +605,6 @@ elif score <= -3:
 
 
 else:
-
     signal = "NO TRADE"
     entry = price
 
@@ -613,24 +612,12 @@ else:
     tp1 = None
     tp2 = None
     tp3 = None
-
     risk = None
 
     reasons.append(
-        "شرایط فعلی برای ورود قدرتمند کافی نیست."
-    )# ------------------------
-# SIGNAL DETAILS
-# ------------------------
-
-# سیگنال اصلی همین‌جا از موتور تحلیل قبلی گرفته می‌شود
-# و دوباره بازنویسی نمی‌شود.
-
-# قدرت روند: 0 تا 100
-trend_strength = min(
-    100,
-    abs(score) * 20
-)
-
+        "شرایط کافی برای ورود به معامله وجود ندارد."
+    )
+    
 # Confidence: 0 تا 100
 confidence = round(
     ((score + 5) / 10) * 100
