@@ -591,7 +591,43 @@ risk = None
 # -----------------------
 # LONG
 # -----------------------
+# =========================
+# STAGE 7 — WEAK SIGNAL FILTER
+# =========================
 
+if score >= 3:
+    # فیلتر LONG
+    if (
+        mtf_trends["4h"] == "BEARISH"
+        and mtf_trends["1d"] == "BEARISH"
+    ):
+        score = 0
+        reasons.append(
+            "LONG رد شد: روند 4 ساعته و روزانه نزولی هستند."
+        )
+
+    elif current_rsi >= 75:
+        score = 0
+        reasons.append(
+            "LONG رد شد: RSI بیش از حد بالا است."
+        )
+
+elif score <= -3:
+    # فیلتر SHORT
+    if (
+        mtf_trends["4h"] == "BULLISH"
+        and mtf_trends["1d"] == "BULLISH"
+    ):
+        score = 0
+        reasons.append(
+            "SHORT رد شد: روند 4 ساعته و روزانه صعودی هستند."
+        )
+
+    elif current_rsi <= 25:
+        score = 0
+        reasons.append(
+            "SHORT رد شد: RSI بیش از حد پایین است."
+        )
 if score >= 3:
 
     signal = "LONG"
