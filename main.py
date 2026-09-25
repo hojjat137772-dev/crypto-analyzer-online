@@ -618,104 +618,70 @@ else:
 
     reasons.append(
         "شرایط فعلی برای ورود قدرتمند کافی نیست."
-    )# --------------------
-# SMART SIGNAL ENGINE
-# --------------------
+    )# ------------------------
+# SIGNAL DETAILS
+# ------------------------
 
-signal = "NO TRADE"
-entry = price
+# سیگنال اصلی همین‌جا از موتور تحلیل قبلی گرفته می‌شود
+# و دوباره بازنویسی نمی‌شود.
 
-stop_loss = None
-tp1 = None
-tp2 = None
-tp3 = None
-risk = None
+# قدرت روند: 0 تا 100
+trend_strength = min(
+    100,
+    abs(score) * 20
+)
 
-# قدرت روند بر اساس امتیاز فعلی
-trend_strength = min(100, abs(score) * 20)
+# Confidence: 0 تا 100
+confidence = round(
+    ((score + 5) / 10) * 100
+)
 
-# LONG
-if score >= 3:
-    signal = "LONG"
-    entry = price
+confidence = max(
+    0,
+    min(100, confidence)
+)
 
-    risk = max(current_atr * 1.5, price * 0.005)
+# ------------------------
+# RISK / REWARD
+# ------------------------
 
-    stop_loss = entry - risk
+rr1 = None
+rr2 = None
+rr3 = None
 
-    tp1 = entry + (risk * 1.5)
-    tp2 = entry + (risk * 2.5)
-    tp3 = entry + (risk * 3.5)
+if signal == "LONG" and risk is not None and risk > 0:
 
-    reasons.append(
-        "سیگنال LONG بر اساس مجموع شرایط تکنیکال صادر شد."
+    rr1 = round(
+        (tp1 - entry) / risk,
+        2
     )
 
-# SHORT
-elif score <= -3:
-    signal = "SHORT"
-    entry = price
-
-    risk = max(current_atr * 1.5, price * 0.005)
-
-    stop_loss = entry + risk
-
-    tp1 = entry - (risk * 1.5)
-    tp2 = entry - (risk * 2.5)
-    tp3 = entry - (risk * 3.5)
-
-    reasons.append(
-        "سیگنال SHORT بر اساس مجموع شرایط تکنیکال صادر شد."
+    rr2 = round(
+        (tp2 - entry) / risk,
+        2
     )
 
-# NO TRADE
-else:
-    signal = "NO TRADE"
-    entry = price
-
-    stop_loss = None
-    tp1 = None
-    tp2 = None
-    tp3 = None
-    risk = None
-
-    reasons.append(
-        "شرایط کافی برای ورود به معامله وجود ندارد."
-    )
-    # -------------------------
-    # Confidence 0 - 100
-    # -------------------------
-
-    confidence = round(
-        ((score + 5) / 10) * 100
+    rr3 = round(
+        (tp3 - entry) / risk,
+        2
     )
 
-    confidence = max(
-        0,
-        min(100, confidence)
+elif signal == "SHORT" and risk is not None and risk > 0:
+
+    rr1 = round(
+        (entry - tp1) / risk,
+        2
     )
 
-    # -------------------------
-    # Risk / Reward
-    # -------------------------
+    rr2 = round(
+        (entry - tp2) / risk,
+        2
+    )
 
-    rr1 = None
-    rr2 = None
-    rr3 = None
-
-    if signal == "LONG" and risk and risk > 0:
-
-        rr1 = round((tp1 - entry) / risk, 2)
-        rr2 = round((tp2 - entry) / risk, 2)
-        rr3 = round((tp3 - entry) / risk, 2)
-
-    elif signal == "SHORT" and risk and risk > 0:
-
-        rr1 = round((entry - tp1) / risk, 2)
-        rr2 = round((entry - tp2) / risk, 2)
-        rr3 = round((entry - tp3) / risk, 2)
-
-    
+    rr3 = round(
+        (entry - tp3) / risk,
+        2
+    )
     # -------------------------
     # Rounding
     # -------------------------
