@@ -670,26 +670,45 @@ else:
         "شرایط کافی برای ورود به معامله وجود ندارد."
     )
 
-# --------------------
-# CONFIDENCE
-# --------------------
+# ----------------
+# CONFIDENCE ENGINE
+# ----------------
 
+# تبدیل امتیاز فعلی به بازه 0 تا 100
 confidence = round(
-    min(100, abs(score) / 5 * 100)
+    max(
+        0,
+        min(
+            100,
+            ((score + 6) / 12) * 100
+        )
+    )
 )
 
-# تقویت اعتماد بر اساس RSI
-if signal == "LONG" and 50 < current_rsi < 70:
+# تقویت Confidence بر اساس RSI
+if signal == "LONG":
+    if 50 <= current_rsi <= 65:
+        confidence += 5
+    elif current_rsi > 70:
+        confidence -= 5
+
+elif signal == "SHORT":
+    if 35 <= current_rsi <= 50:
+        confidence += 5
+    elif current_rsi < 30:
+        confidence -= 5
+
+# تقویت بر اساس حجم
+if volume_ratio >= 1.20:
     confidence += 5
 
-elif signal == "SHORT" and 30 < current_rsi < 50:
-    confidence += 5
-
-# محدود کردن Confidence به 0 تا 100
+# محدود کردن به 0 تا 100
 confidence = max(
     0,
     min(100, confidence)
 )
+
+confidence = round(confidence)
 # ------------------------
 # RISK / REWARD
 # ------------------------
