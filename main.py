@@ -465,7 +465,7 @@ def add_indicators(df):
 # ANALYSIS
 # =========================================================
 
-def analyze(df):
+def analyze(df, symbol=None):
 
     d = add_indicators(df)
 
@@ -479,6 +479,14 @@ def analyze(df):
     x = d.iloc[-1]
 
     price = float(x["close"])
+    # =========================
+# STAGE 6 — MTF CONFIRMATION
+# =========================
+
+mtf_trends = get_mtf_trend(symbol) if symbol else {
+    "4h": "UNKNOWN",
+    "1d": "UNKNOWN"
+    }
     current_atr = float(x["atr"])
     current_rsi = float(x["rsi"])
 score = 0
@@ -543,8 +551,26 @@ if volume_ratio >= 1.20:
 else:
     reasons.append("حجم معاملات تأیید قدرتمندی نمی‌دهد.")
 
-# محدود کردن امتیاز
-score = max(-6, min(6, score))
+# =========================
+# STAGE 6 — MTF SCORE
+# =========================
+
+if mtf_trends["4h"] == "BULLISH":
+    score += 1
+    reasons.append("روند 4 ساعته صعودی است.")
+
+elif mtf_trends["4h"] == "BEARISH":
+    score -= 1
+    reasons.append("روند 4 ساعته نزولی است.")
+
+if mtf_trends["1d"] == "BULLISH":
+    score += 1
+    reasons.append("روند روزانه صعودی است.")
+
+elif mtf_trends["1d"] == "BEARISH":
+    score -= 1
+    reasons.append("روند روزانه نزولی است.")# محدود کردن امتیاز
+score = max(-8, min(8, score))
     
 # -----------------------
 # SMART SIGNAL ENGINE
@@ -967,7 +993,7 @@ def analyze_market(
         interval
     )
 
-    result = analyze(df)
+    result = analyze(df, symbol)
 
     result["symbol"] = symbol
 
