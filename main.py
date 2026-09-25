@@ -812,7 +812,41 @@ return {
     "score": score,
 
     "reasons": reasons
-}
+}# ============================================================
+# MULTI TIMEFRAME ANALYSIS
+# ============================================================
+
+def get_mtf_analysis(symbol):
+    mtf_results = {}
+
+    timeframes = {
+        "1h": "1h",
+        "4h": "4h",
+        "1d": "1d"
+    }
+
+    for name, tf in timeframes.items():
+        try:
+            df, pair = get_ohlc(symbol, tf)
+
+            analysis = analyze(df)
+
+            mtf_results[name] = {
+                "signal": analysis.get("signal", "NO TRADE"),
+                "confidence": analysis.get("confidence", 0),
+                "score": analysis.get("score", 0),
+                "trend_strength": analysis.get("trend_strength", 0)
+            }
+
+        except Exception:
+            mtf_results[name] = {
+                "signal": "NO TRADE",
+                "confidence": 0,
+                "score": 0,
+                "trend_strength": 0
+            }
+
+    return mtf_results
 # =========================================================
 # HEALTH
 # =========================================================
