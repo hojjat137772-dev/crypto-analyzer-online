@@ -445,7 +445,15 @@ def add_indicators(df):
         d,
         14
     )
+    # --------------------------
+    # VOLUME ANALYSIS
+    # --------------------------
 
+    d["volume_ma20"] = d["volume"].rolling(20).mean()
+
+    d["volume_ratio"] = (
+        d["volume"] / d["volume_ma20"]
+    )
     return (
         d
         .dropna()
