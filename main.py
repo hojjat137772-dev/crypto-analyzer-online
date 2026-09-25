@@ -676,69 +676,44 @@ else:
 
             return None
 
-    return {
+return {
+    "signal": signal,
 
-        "signal": signal,
+    "price": rnd(price),
+    "entry": rnd(entry),
 
-        "price": rnd(price),
+    "stop_loss": rnd(stop_loss),
 
-        "entry": rnd(entry),
+    "take_profit_1": rnd(tp1),
+    "take_profit_2": rnd(tp2),
+    "take_profit_3": rnd(tp3),
 
-        "stop_loss": rnd(stop_loss),
+    "risk": rnd(risk),
 
-        "take_profit_1": rnd(tp1),
+    "confidence": confidence,
 
-        "take_profit_2": rnd(tp2),
+    "rr1": rr1,
+    "rr2": rr2,
+    "rr3": rr3,
 
-        "take_profit_3": rnd(tp3),
+    "rsi": round(current_rsi, 2),
 
-        "rsi": round(
-            current_rsi,
-            2
-        ),
+    "ema20": rnd(x["ema20"]),
+    "ema50": rnd(x["ema50"]),
+    "ema200": rnd(x["ema200"]),
 
-        "ema20": rnd(
-            x["ema20"]
-        ),
+    "macd": rnd(x["macd"]),
+    "macd_signal": rnd(x["macd_signal"]),
 
-        "ema50": rnd(
-            x["ema50"]
-        ),
+    "atr": rnd(current_atr),
 
-        "ema200": rnd(
-            x["ema200"]
-        ),
+    "support": rnd(support),
+    "resistance": rnd(resistance),
 
-        "macd": rnd(
-            x["macd"]
-        ),
+    "score": score,
 
-        "macd_signal": rnd(
-            x["macd_signal"]
-        ),
-
-        "atr": rnd(
-            current_atr
-        ),
-
-        "support": rnd(
-            support
-        ),
-
-        "resistance": rnd(
-            resistance
-        ),
-
-        "score": score,
-"confidence": confidence,
-
-"risk_reward_1": rr1,
-"risk_reward_2": rr2,
-"risk_reward_3": rr3,
-        "reasons": reasons
-    }
-
-
+    "reasons": reasons
+}
 # =========================================================
 # HEALTH
 # =========================================================
