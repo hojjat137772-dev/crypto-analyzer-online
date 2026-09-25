@@ -812,41 +812,106 @@ return {
     "score": score,
 
     "reasons": reasons
-}# ============================================================
+# ============================================================
 # MULTI TIMEFRAME ANALYSIS
 # ============================================================
 
-def get_mtf_analysis(symbol):
-    mtf_results = {}
-
+def get_multi_timeframe_analysis(symbol):
     timeframes = {
-        "1h": "1h",
-        "4h": "4h",
-        "1d": "1d"
+        "1h": "1 ساعت",
+        "4h": "4 ساعت",
+        "1d": "1 روز"
     }
 
-    for name, tf in timeframes.items():
+    result = {}
+
+    for interval, title in timeframes.items():
         try:
-            df, pair = get_ohlc(symbol, tf)
+            df, pair = get_ohlc(symbol, interval)
+            data = analyze(df)
 
-            analysis = analyze(df)
+            signal = data.get("signal", "NO TRADE")
+            score = data.get("score", 0)
 
-            mtf_results[name] = {
-                "signal": analysis.get("signal", "NO TRADE"),
-                "confidence": analysis.get("confidence", 0),
-                "score": analysis.get("score", 0),
-                "trend_strength": analysis.get("trend_strength", 0)
+            if score >= 3:
+                trend = "صعودی"
+            elif score <= -3:
+                trend = "نزولی"
+            else:
+                trend = "خنثی"
+
+            result[interval] = {
+                "title": title,
+                "signal": signal,
+                "trend": trend,
+                "score": score,
+                "confidence": data.get("confidence", 0),
+                "rsi": data.get("rsi")
             }
 
-        except Exception:
-            mtf_results[name] = {
+        except Exception as e:
+            result[interval] = {
+                "title": title,
                 "signal": "NO TRADE",
-                "confidence": 0,
+                "trend": "نامشخص",
                 "score": 0,
-                "trend_strength": 0
+                "confidence": 0,
+                "rsi": None,
+                "error": str(e)
             }
 
-    return mtf_results
+    # --------------------------------------------------------
+    # FINAL MULTI-TIMEFRAME DECISION
+    # --------------------------------------------------------
+
+    h1 = result.get("1h", {})
+    h4 = result.get("4h", {})
+    d1 = result.get("1d", {})
+
+    signals = [
+        h1.get("signal"),
+        h4.get("signal"),
+        d1.get("signal")
+    ]
+
+    if h1.get("signal") == "LONG" and h4.get("signal") == "LONG":
+        final_trend = "LONG"
+
+    elif h1.get("signal") == "SHORT" and h4.get("signal") == "SHORT":
+        final_trend = "SHORT"
+
+    else:
+        final_trend = "NO TRADE"
+
+    # --------------------------------------------------------
+    # ALIGNMENT SCORE
+    # --------------------------------------------------------
+
+    alignment = 0
+
+    if h1.get("signal") == h4.get("signal"):
+        if h1.get("signal") in ["LONG", "SHORT"]:
+            alignment += 40
+
+    if h4.get("signal") == d1.get("signal"):
+        if h4.get("signal") in ["LONG", "SHORT"]:
+            alignment += 30
+
+    if d1.get("signal") == h1.get("signal"):
+        if d1.get("signal") in ["LONG", "SHORT"]:
+            alignment += 30
+
+    # --------------------------------------------------------
+    # FINAL RESULT
+    # --------------------------------------------------------
+
+    return {
+        "1h": h1,
+        "4h": h4,
+        "1d": d1,
+        "final_signal": final_trend,
+        "alignment": alignment
+    }
 # =========================================================
 # HEALTH
 # =========================================================
@@ -894,7 +959,8 @@ def analyze_market(
     result["interval"] = interval
 result["mtf"] = get_mtf_analysis(symbol)
     result["data_source"] = "Kraken"
-
+    # MULTI TIMEFRAME
+    result["multi_timeframe"] = get_multi_timeframe_analysis(symbol)
     return result
 
 
