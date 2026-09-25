@@ -1293,7 +1293,65 @@ ${formatNumber(data.rsi)}
 
 </div>
 
+<div class="box">
 
+اعتماد تحلیل
+
+<br>
+
+<b>
+${formatNumber(data.confidence)}%
+</b>
+
+</div>
+
+<div class="box">
+
+قدرت روند
+
+<br>
+
+<b>
+${formatNumber(data.trend_strength)}
+</b>
+
+</div>
+
+<div class="box">
+
+R/R - TP1
+
+<br>
+
+<b>
+${formatNumber(data.rr1)}
+</b>
+
+</div>
+
+<div class="box">
+
+R/R - TP2
+
+<br>
+
+<b>
+${formatNumber(data.rr2)}
+</b>
+
+</div>
+
+<div class="box">
+
+R/R - TP3
+
+<br>
+
+<b>
+${formatNumber(data.rr3)}
+</b>
+
+</div>
 <div class="box">
 
 ورود
