@@ -486,7 +486,6 @@ def analyze(df, symbol=None):
 mtf_trends = get_mtf_trend(symbol) if symbol else {
     "4h": "UNKNOWN",
     "1d": "UNKNOWN"
-    }
     current_atr = float(x["atr"])
     current_rsi = float(x["rsi"])
 score = 0
