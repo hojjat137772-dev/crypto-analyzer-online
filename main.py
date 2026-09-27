@@ -790,9 +790,9 @@ confidence = round(confidence)
 # RISK / REWARD
 # ------------------------
 
-rr1 = None
-rr2 = None
-rr3 = None
+    rr1 = None
+    rr2 = None
+    rr3 = None
 
     if signal == "LONG" and risk is not None and risk > 0:
         rr1 = round(
