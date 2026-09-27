@@ -794,77 +794,66 @@ rr1 = None
 rr2 = None
 rr3 = None
 
-if signal == "LONG" and risk is not None and risk > 0:
+    if signal == "LONG" and risk is not None and risk > 0:
+        rr1 = round(
+            (tp1 - entry) / risk,
+            2
+        )
 
-    rr1 = round(
-        (tp1 - entry) / risk,
-        2
-    )
+        rr2 = round(
+            (tp2 - entry) / risk,
+            2
+        )
 
-    rr2 = round(
-        (tp2 - entry) / risk,
-        2
-    )
+        rr3 = round(
+            (tp3 - entry) / risk,
+            2
+        )
 
-    rr3 = round(
-        (tp3 - entry) / risk,
-        2
-    )
+    elif signal == "SHORT" and risk is not None and risk > 0:
+        rr1 = round(
+            (entry - tp1) / risk,
+            2
+        )
 
-elif signal == "SHORT" and risk is not None and risk > 0:
+        rr2 = round(
+            (entry - tp2) / risk,
+            2
+        )
 
-    rr1 = round(
-        (entry - tp1) / risk,
-        2
-    )
+        rr3 = round(
+            (entry - tp3) / risk,
+            2
+        )
 
-    rr2 = round(
-        (entry - tp2) / risk,
-        2
-    )
-
-    rr3 = round(
-        (entry - tp3) / risk,
-        2
-    )         
     return {
         "signal": signal,
         "price": rnd(price),
         "entry_low": rnd(entry_low),
         "entry_high": rnd(entry_high),
         "entry": rnd(entry),
-
         "stop_loss": rnd(stop_loss),
         "take_profit_1": rnd(tp1),
         "take_profit_2": rnd(tp2),
         "take_profit_3": rnd(tp3),
-
         "risk": rnd(risk),
-
         "confidence": confidence,
         "trend_strength": trend_strength,
         "rr1": rr1,
         "rr2": rr2,
         "rr3": rr3,
-
         "rsi": round(current_rsi, 2),
-
         "ema20": rnd(x["ema20"]),
         "ema50": rnd(x["ema50"]),
         "ema200": rnd(x["ema200"]),
-
         "macd": rnd(x["macd"]),
         "macd_signal": rnd(x["macd_signal"]),
-
         "atr": rnd(current_atr),
-
         "support": rnd(support),
         "resistance": rnd(resistance),
-
         "score": score,
-
         "reasons": reasons
-}
+    }
     # -------------------------
     # Rounding
     # -------------------------
