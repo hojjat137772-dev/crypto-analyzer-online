@@ -886,7 +886,8 @@ elif signal == "SHORT" and risk is not None and risk > 0:
                 8
             )
 
-
+    except Exception:
+        return None
                                 
 # ============================================================
 # MULTI TIMEFRAME ANALYSIS
@@ -934,8 +935,9 @@ def get_multi_timeframe_analysis(symbol):
                 "confidence": 0,
                 "rsi": None,
                 "error": str(e)
-            }
-
+            }    except Exception:
+        return None
+    
     # --------------------------------------------------------
     # FINAL MULTI-TIMEFRAME DECISION
     # --------------------------------------------------------
