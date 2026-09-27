@@ -826,31 +826,7 @@ elif signal == "SHORT" and risk is not None and risk > 0:
     rr3 = round(
         (entry - tp3) / risk,
         2
-    )
-    # -------------------------
-    # Rounding
-    # -------------------------
-
-    def rnd(value):
-
-        if value is None:
-            return None
-
-        try:
-
-            value = float(value)
-
-            if not math.isfinite(value):
-                return None
-
-            return round(
-                value,
-                8
-            )
-
-        except Exception:
-
-            return None
+    )        
     return {
         "signal": signal,
         "price": rnd(price),
@@ -888,7 +864,29 @@ elif signal == "SHORT" and risk is not None and risk > 0:
         "score": score,
 
         "reasons": reasons
-    }
+}
+    # -------------------------
+    # Rounding
+    # -------------------------
+
+    def rnd(value):
+
+        if value is None:
+            return None
+
+        try:
+
+            value = float(value)
+
+            if not math.isfinite(value):
+                return None
+
+            return round(
+                value,
+                8
+            )
+
+
                                 
 # ============================================================
 # MULTI TIMEFRAME ANALYSIS
