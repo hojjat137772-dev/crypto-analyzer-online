@@ -1280,7 +1280,7 @@ def analyze_market(
     result["pair"] = pair
 
     result["interval"] = interval
-result["mtf"] = get_mtf_analysis(symbol)
+    result["mtf"] = get_mtf_analysis(symbol)
     result["data_source"] = "Kraken"
     # MULTI TIMEFRAME
     result["multi_timeframe"] = get_multi_timeframe_analysis(symbol)
