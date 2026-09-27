@@ -826,8 +826,7 @@ elif signal == "SHORT" and risk is not None and risk > 0:
     rr3 = round(
         (entry - tp3) / risk,
         2
-    )          except Exception:
-        return None  
+    )         
     return {
         "signal": signal,
         "price": rnd(price),
