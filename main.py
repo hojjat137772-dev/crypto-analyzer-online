@@ -884,11 +884,9 @@ elif signal == "SHORT" and risk is not None and risk > 0:
             return round(
                 value,
                 8
-            )
-
+            )   
     except Exception:
         return None
-                                
 # ============================================================
 # MULTI TIMEFRAME ANALYSIS
 # ============================================================
