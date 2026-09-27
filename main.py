@@ -899,7 +899,7 @@ def get_multi_timeframe_analysis(symbol):
     for interval, title in timeframes.items():
         try:
             df, pair = get_ohlc(symbol, interval)
-            data = analyze(df)
+            data = analyze(df, symbol)
 
             signal = data.get("signal", "NO TRADE")
             score = data.get("score", 0)
