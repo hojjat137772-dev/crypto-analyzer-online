@@ -694,7 +694,7 @@ entry_low = max(entry_low, price - (0.5 * current_atr))
 entry_high = min(entry_high, price + (1.0 * current_atr))
     # حد ضرر ترکیبی:
     # مقاومت + ATR
-    atr_stop = price + (1.5 * current_atr)
+        atr_stop = price + (1.5 * current_atr)
 
     if resistance is not None:
         stop_loss = max(resistance, atr_stop)
