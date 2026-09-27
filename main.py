@@ -799,7 +799,6 @@ rr3 = None
             (tp1 - entry) / risk,
             2
         )
-
         rr2 = round(
             (tp2 - entry) / risk,
             2
