@@ -870,7 +870,6 @@ elif signal == "SHORT" and risk is not None and risk > 0:
     # -------------------------
 
     def rnd(value):
-
     if value is None:
         return None
 
