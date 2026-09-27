@@ -630,53 +630,53 @@ elif score <= -3:
             "SHORT رد شد: RSI بیش از حد پایین است."
         )
 if score >= 3:
+    if score >= 3:
+        signal = "LONG"
+        entry = price
 
-    signal = "LONG"
-    entry = price
-# SMART LONG ENTRY ZONE
-entry_low = min(price, float(x["ema20"])) - (0.25 * current_atr)
-entry_high = max(price, float(x["ema20"])) + (0.15 * current_atr)
+        # SMART LONG ENTRY ZONE
+        entry_low = min(price, float(x["ema20"])) - (0.25 * current_atr)
+        entry_high = max(price, float(x["ema20"])) + (0.15 * current_atr)
 
-# جلوگیری از ورود به محدوده خیلی دور
-entry_low = max(entry_low, price - (1.0 * current_atr))
-entry_high = min(entry_high, price + (0.5 * current_atr))
-    # حد ضرر ترکیبی:
-    # حمایت + ATR
-    atr_stop = price - (1.5 * current_atr)
+        # جلوگیری از ورود بیش از حد دور
+        entry_low = max(entry_low, price - (1.0 * current_atr))
+        entry_high = min(entry_high, price + (0.5 * current_atr))
 
-    if support is not None:
-        stop_loss = min(support, atr_stop)
-    else:
-        stop_loss = atr_stop
+        # حد ضرر ترکیبی ATR + حمایت
+        atr_stop = price - (1.5 * current_atr)
 
-    # جلوگیری از حد ضرر نامعتبر
-    if stop_loss >= entry:
-        stop_loss = entry - (1.5 * current_atr)
+        if support is not None:
+            stop_loss = min(support, atr_stop)
+        else:
+            stop_loss = atr_stop
 
-    risk = max(
-        entry - stop_loss,
-        current_atr * 0.5
-    )
+        # جلوگیری از حد ضرر نامعتبر
+        if stop_loss >= entry:
+            stop_loss = entry - (1.5 * current_atr)
 
-    # اهداف اولیه
-    raw_tp1 = entry + (1.5 * risk)
-    raw_tp2 = entry + (2.5 * risk)
-    raw_tp3 = entry + (3.5 * risk)
+        risk = max(
+            entry - stop_loss,
+            current_atr * 0.5
+        )
 
-    # استفاده از مقاومت در هدف اول، اگر معتبر باشد
-    if resistance is not None and resistance > entry:
-        tp1 = resistance
-    else:
-        tp1 = raw_tp1
+        # اهداف اولیه
+        raw_tp1 = entry + (1.5 * risk)
+        raw_tp2 = entry + (2.5 * risk)
+        raw_tp3 = entry + (3.5 * risk)
 
-    # جلوگیری از نزدیک بودن TP2 و TP3
-    tp2 = max(raw_tp2, tp1 + risk)
-    tp3 = max(raw_tp3, tp2 + risk)
+        # اگر مقاومت معتبر وجود داشت، TP1 روی مقاومت
+        if resistance is not None and resistance > entry:
+            tp1 = resistance
+        else:
+            tp1 = raw_tp1
 
-    reasons.append(
-        "مجموع شرایط تکنیکال برای LONG تأیید شده است."
-    )
+        # جلوگیری از نزدیک بودن TP2 و TP3
+        tp2 = max(raw_tp2, tp1 + risk)
+        tp3 = max(raw_tp3, tp2 + risk)
 
+        reasons.append(
+            "برای LONG مجموع شرایط تکنیکال تأیید شده است."
+        )
 # -----------------------
 # SHORT
 # -----------------------
