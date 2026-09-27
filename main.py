@@ -929,9 +929,8 @@ def get_multi_timeframe_analysis(symbol):
                 "confidence": 0,
                 "rsi": None,
                 "error": str(e)
-            }    except Exception:
-        return None
-    
+
+            }
     # --------------------------------------------------------
     # FINAL MULTI-TIMEFRAME DECISION
     # --------------------------------------------------------
