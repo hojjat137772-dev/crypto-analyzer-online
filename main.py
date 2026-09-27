@@ -851,50 +851,44 @@ elif signal == "SHORT" and risk is not None and risk > 0:
         except Exception:
 
             return None
+    return {
+        "signal": signal,
+        "price": rnd(price),
+        "entry_low": rnd(entry_low),
+        "entry_high": rnd(entry_high),
+        "entry": rnd(entry),
 
-return {
-    "signal": signal,
+        "stop_loss": rnd(stop_loss),
+        "take_profit_1": rnd(tp1),
+        "take_profit_2": rnd(tp2),
+        "take_profit_3": rnd(tp3),
 
-    "price": rnd(price),
-    "entry_low": rnd(entry_low),
-"entry_high": rnd(entry_high),
-    "entry": rnd(entry),
+        "risk": rnd(risk),
 
-    "stop_loss": rnd(stop_loss),
+        "confidence": confidence,
+        "trend_strength": trend_strength,
+        "rr1": rr1,
+        "rr2": rr2,
+        "rr3": rr3,
 
-    "take_profit_1": rnd(tp1),
-    "take_profit_2": rnd(tp2),
-    "take_profit_3": rnd(tp3),
+        "rsi": round(current_rsi, 2),
 
-    "risk": rnd(risk),
+        "ema20": rnd(x["ema20"]),
+        "ema50": rnd(x["ema50"]),
+        "ema200": rnd(x["ema200"]),
 
-    "confidence": confidence,
-"trend_strength": trend_strength,
-    "rr1": rr1,
-    "rr2": rr2,
-    "rr3": rr3,
+        "macd": rnd(x["macd"]),
+        "macd_signal": rnd(x["macd_signal"]),
 
-    "rsi": round(current_rsi, 2),
+        "atr": rnd(current_atr),
 
-    "ema20": rnd(x["ema20"]),
-    "ema50": rnd(x["ema50"]),
-    "ema200": rnd(x["ema200"]),
+        "support": rnd(support),
+        "resistance": rnd(resistance),
 
-    "macd": rnd(x["macd"]),
-    "macd_signal": rnd(x["macd_signal"]),
+        "score": score,
 
-    "atr": rnd(current_atr),
-
-    "support": rnd(support),
-    "resistance": rnd(resistance),
-
-    "score": score,
-
-    "reasons": reasons
-     
-    
+        "reasons": reasons
     }
-    
                                 
 # ============================================================
 # MULTI TIMEFRAME ANALYSIS
