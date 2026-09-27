@@ -868,7 +868,6 @@ elif signal == "SHORT" and risk is not None and risk > 0:
     # -------------------------
     # Rounding
     # -------------------------
-
 def rnd(value):
     if value is None:
         return None
@@ -887,10 +886,6 @@ def rnd(value):
 # MULTI TIMEFRAME ANALYSIS
 # ============================================================
 
-def get_multi_timeframe_analysis(symbol):
-# ============================================================
-# MULTI TIMEFRAME ANALYSIS
-# ============================================================
 
 def get_multi_timeframe_analysis(symbol):
     timeframes = {
