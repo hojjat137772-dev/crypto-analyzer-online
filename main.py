@@ -871,22 +871,26 @@ elif signal == "SHORT" and risk is not None and risk > 0:
 
     def rnd(value):
 
-        if value is None:
+    if value is None:
+        return None
+
+    try:
+        value = float(value)
+
+        if not math.isfinite(value):
             return None
 
-        try:
+        return round(value, 8)
 
-            value = float(value)
-
-            if not math.isfinite(value):
-                return None
-
-            return round(
-                value,
-                8
-            )   
     except Exception:
         return None
+
+
+# ============================================================
+# MULTI TIMEFRAME ANALYSIS
+# ============================================================
+
+def get_multi_timeframe_analysis(symbol):
 # ============================================================
 # MULTI TIMEFRAME ANALYSIS
 # ============================================================
