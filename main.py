@@ -15,14 +15,28 @@ app = FastAPI(
 # سفارش‌گذاری: از طریق EasyTrader به صورت دستی/تأییدشده
 # ============================================================
 
+# ============================================================
+# لایه اتصال داده بازار ایران - نسخه مقاوم برای Render
+# ============================================================
+# نکته: TSETMC روی بعضی IPهای خارج از ایران محدودیت جغرافیایی دارد.
+# بنابراین چند مسیر را امتحان می‌کنیم. اگر همه مسیرها مسدود باشند،
+# برنامه خطای واضح می‌دهد و تحلیل جعلی تولید نمی‌کند.
+
 TSETMC_CDN = "https://cdn.tsetmc.com/api"
+TSETMC_MIRROR = "https://cdn10.tsetmc.com/api"
+TSETMC_WEBGW = "https://webgw.tse.ir/InstrumentProvider/api/v1"
 EASYTRADER_URL = "https://easytrader.emofid.com"
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Android) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120 Safari/537.36",
-    "Accept": "application/json, text/plain, */*"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
 })
 
 
@@ -39,21 +53,79 @@ def fa_to_en(text):
     ))
 
 
-def get_json(url, timeout=20):
+def _request_json(url, timeout=8):
+    """یک درخواست کوتاه؛ Timeout طولانی باعث گیر کردن UI نمی‌شود."""
+    r = session.get(url, timeout=(4, timeout), allow_redirects=True)
+    r.raise_for_status()
+    return r.json()
+
+
+def _is_blocked_response(exc):
+    text = str(exc).lower()
+    return any(x in text for x in [
+        "timed out", "timeout", "403", "forbidden", "connection refused",
+        "max retries", "502", "503", "504", "connection reset"
+    ])
+
+
+def get_json(url, timeout=8):
     try:
-        r = session.get(url, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except requests.RequestException as e:
+        return _request_json(url, timeout=timeout)
+    except (requests.RequestException, ValueError) as e:
         raise HTTPException(
             status_code=502,
             detail=f"ارتباط با منبع داده بورس برقرار نشد: {e}"
         )
-    except ValueError:
-        raise HTTPException(
-            status_code=502,
-            detail="پاسخ نامعتبر از منبع داده بورس دریافت شد."
-        )
+
+
+def _search_cdn(symbol):
+    """CDN اصلی و mirror را امتحان می‌کند."""
+    encoded = requests.utils.quote(symbol, safe="")
+    urls = [
+        f"{TSETMC_CDN}/Instrument/GetInstrumentSearch/{encoded}",
+        f"{TSETMC_MIRROR}/Instrument/GetInstrumentSearch/{encoded}",
+    ]
+    errors = []
+    for url in urls:
+        try:
+            data = _request_json(url, timeout=7)
+            items = data.get("instrumentSearch", []) if isinstance(data, dict) else []
+            if items:
+                return items
+        except Exception as e:
+            errors.append(str(e))
+    return []
+
+
+def _search_webgw(symbol):
+    """جستجوی نماد از Gateway سایت tse.ir."""
+    try:
+        url = f"{TSETMC_WEBGW}/Instrument/InstrumentShortcut/fa"
+        params = {
+            "SimpleSearchText": symbol,
+            "PageNumber": 1,
+            "PageSize": 20,
+        }
+        r = session.get(url, params=params, timeout=(4, 7))
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("items", []) if isinstance(data, dict) else []
+        normalized = []
+        for x in items:
+            isin = x.get("instrumentid") or x.get("instrumentId") or x.get("isin")
+            name = x.get("instrument_Name") or x.get("instrumentName") or ""
+            company = x.get("company_Name_Persian") or x.get("companyNamePersian") or ""
+            normalized.append({
+                "insCode": x.get("insCode") or x.get("instrumentCode"),
+                "lVal18AFC": name,
+                "lVal30": company,
+                "cIsin": isin,
+                "flow": x.get("markettypeid"),
+                "_source": "webgw",
+            })
+        return normalized
+    except Exception:
+        return []
 
 
 def search_instrument(symbol: str):
@@ -61,41 +133,82 @@ def search_instrument(symbol: str):
     if not symbol:
         raise HTTPException(400, "نماد را وارد کنید.")
 
-    data = get_json(
-        f"{TSETMC_CDN}/Instrument/GetInstrumentSearch/{requests.utils.quote(symbol)}"
-    )
-    items = data.get("instrumentSearch", [])
+    items = _search_cdn(symbol)
+    source = "TSETMC CDN"
 
     if not items:
-        raise HTTPException(404, f"نماد «{symbol}» پیدا نشد.")
+        items = _search_webgw(symbol)
+        source = "TSE Web Gateway"
 
-    # اولویت با تطبیق دقیق نماد
+    if not items:
+        raise HTTPException(
+            502,
+            "نماد پیدا نشد یا دسترسی Render به سرویس داده بورس ایران مسدود است. "
+            "این مشکل از تحلیل تکنیکال نیست؛ TSETMC برای برخی IPهای خارج از ایران محدودیت دسترسی دارد."
+        )
+
     exact = [
         x for x in items
         if str(x.get("lVal18AFC", "")).strip() == symbol
     ]
-    return (exact[0] if exact else items[0]), items
+    item = exact[0] if exact else items[0]
+    item["_data_source"] = source
+    return item, items
 
 
-def get_history(ins_code: str):
-    data = get_json(
-        f"{TSETMC_CDN}/ClosingPrice/GetClosingPriceDailyList/{ins_code}/0"
-    )
-    rows = data.get("closingPriceDaily", [])
+def _history_webgw(isin):
+    if not isin:
+        return None
+    try:
+        url = f"{TSETMC_WEBGW}/History/Archive/fa"
+        r = session.get(url, params={"InstrumentId": isin}, timeout=(4, 10))
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        for key in ["items", "history", "archive", "data"]:
+            if isinstance(data, dict) and isinstance(data.get(key), list):
+                return data[key]
+    except Exception:
+        return None
+    return None
+
+
+def get_history(ins_code: str, isin: str = None):
+    rows = None
+
+    # اگر جستجو از webgw انجام شده، تاریخچه را هم از webgw بگیر.
+    if isin:
+        rows = _history_webgw(isin)
+
+    # مسیرهای CDN/mirror
+    if not rows and ins_code:
+        urls = [
+            f"{TSETMC_CDN}/ClosingPrice/GetClosingPriceDailyList/{ins_code}/0",
+            f"{TSETMC_MIRROR}/ClosingPrice/GetClosingPriceDailyList/{ins_code}/0",
+        ]
+        for url in urls:
+            try:
+                data = _request_json(url, timeout=10)
+                rows = data.get("closingPriceDaily", []) if isinstance(data, dict) else []
+                if rows:
+                    break
+            except Exception:
+                continue
 
     if not rows:
-        raise HTTPException(404, "تاریخچه قیمت این نماد در دسترس نیست.")
+        raise HTTPException(
+            502,
+            "تاریخچه قیمت در دسترس نیست. دسترسی سرور به منبع داده بورس ایران محدود شده است."
+        )
 
     records = []
     for row in rows:
-        # endpointهای TSETMC در نسخه‌های مختلف نام‌های نزدیک به هم دارند
+        # فرمت CDN
         date_raw = (
-            row.get("dEven")
-            or row.get("deven")
-            or row.get("date")
-            or row.get("DEven")
+            row.get("dEven") or row.get("deven") or row.get("date") or
+            row.get("DEven") or row.get("devenrlc")
         )
-
         close = row.get("pClosing")
         last = row.get("pDrCotVal")
         high = row.get("priceMax")
@@ -103,6 +216,24 @@ def get_history(ins_code: str):
         open_price = row.get("priceFirst")
         volume = row.get("qTotTran5J")
         value = row.get("qTotCap")
+
+        # فرمت webgw Archive
+        if close is None:
+            close = row.get("closingprice")
+        if close is None:
+            close = row.get("closingPrice")
+        if last is None:
+            last = row.get("lastprice")
+        if high is None:
+            high = row.get("maxValue") or row.get("highvalue")
+        if low is None:
+            low = row.get("minValue") or row.get("lowvalue")
+        if open_price is None:
+            open_price = row.get("firstPrice") or row.get("firstprice")
+        if volume is None:
+            volume = row.get("tradevolume")
+        if value is None:
+            value = row.get("tradevalue")
 
         if close is None:
             continue
@@ -115,7 +246,7 @@ def get_history(ins_code: str):
             "close": close,
             "last": last if last is not None else close,
             "volume": volume,
-            "value": value
+            "value": value,
         })
 
     df = pd.DataFrame(records)
@@ -125,17 +256,13 @@ def get_history(ins_code: str):
     for c in ["open", "high", "low", "close", "last", "volume", "value"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # اگر high/low/open در بعضی روزها نبود، از close استفاده می‌کنیم
     df["high"] = df["high"].fillna(df["close"])
     df["low"] = df["low"].fillna(df["close"])
     df["open"] = df["open"].fillna(df["close"])
-
+    df["volume"] = df["volume"].fillna(0)
+    df["value"] = df["value"].fillna(0)
     df = df.dropna(subset=["close"]).copy()
-
-    # قدیمی -> جدید
     df = df.iloc[::-1].reset_index(drop=True)
-
-    # حذف تاریخ‌های تکراری
     df = df.drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
 
     if len(df) < 60:
@@ -145,12 +272,9 @@ def get_history(ins_code: str):
 
 
 def get_live_info(isin: str):
-    url = (
-        f"https://webgw.tse.ir/InstrumentProvider/api/v1/"
-        f"Instrument/LiveInstrumentByIdQuery/fa"
-    )
+    url = f"{TSETMC_WEBGW}/Instrument/LiveInstrumentByIdQuery/fa"
     try:
-        r = session.get(url, params={"InstrumentId": isin}, timeout=15)
+        r = session.get(url, params={"InstrumentId": isin}, timeout=(4, 7))
         if r.status_code != 200:
             return {}
         return r.json()
@@ -159,14 +283,17 @@ def get_live_info(isin: str):
 
 
 def get_instrument_info(ins_code: str):
-    try:
-        data = get_json(
-            f"{TSETMC_CDN}/Instrument/GetInstrumentInfo/{ins_code}",
-            timeout=15
-        )
-        return data.get("instrumentInfo", data)
-    except Exception:
+    if not ins_code:
         return {}
+    for base in [TSETMC_CDN, TSETMC_MIRROR]:
+        try:
+            data = _request_json(
+                f"{base}/Instrument/GetInstrumentInfo/{ins_code}", timeout=7
+            )
+            return data.get("instrumentInfo", data)
+        except Exception:
+            continue
+    return {}
 
 
 def ema(s, n):
@@ -468,7 +595,7 @@ def analyze_market(symbol: str = Query("استیل")):
     if not ins_code:
         raise HTTPException(404, "شناسه نماد پیدا نشد.")
 
-    df = get_history(ins_code)
+    df = get_history(ins_code, isin)
     result = analyze_stock(df)
 
     fundamental = get_instrument_info(ins_code)
@@ -495,7 +622,7 @@ def run_backtest(
     if not ins_code:
         raise HTTPException(404, "شناسه نماد پیدا نشد.")
 
-    df = get_history(ins_code)
+    df = get_history(ins_code, item.get("cIsin"))
     result = backtest(df, lookback)
 
     return {
