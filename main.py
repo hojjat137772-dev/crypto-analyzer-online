@@ -533,7 +533,9 @@ def analyze(symbol: str = Query(..., min_length=1, max_length=50)):
 @app.get("/backtest")
 def backtest(symbol: str = Query(..., min_length=1, max_length=50)):
     try:
-        df = get_history(symbol, pages=10)
+        # بک‌تست برای EMA200 حداقل به بیش از 205 روز داده نیاز دارد.
+        # 20 صفحه تقریباً 400 روز معاملاتی در اختیار موتور می‌گذارد.
+        df = get_history(symbol, pages=20)
         return run_backtest(df)
     except Exception as exc:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
