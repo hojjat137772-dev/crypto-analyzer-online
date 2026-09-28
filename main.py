@@ -3,2028 +3,611 @@ from fastapi.responses import HTMLResponse
 import requests
 import pandas as pd
 import math
+from datetime import datetime
 
 app = FastAPI(
-    title="Crypto Analyzer Online",
-    version="4.1.0"
+    title="Iran Stock Analyzer - EasyTrader",
+    version="3.0.0"
 )
 
-KRAKEN_API = "https://api.kraken.com/0/public"
+# ============================================================
+# منبع داده بازار ایران: TSETMC
+# سفارش‌گذاری: از طریق EasyTrader به صورت دستی/تأییدشده
+# ============================================================
+
+TSETMC_CDN = "https://cdn.tsetmc.com/api"
+EASYTRADER_URL = "https://easytrader.emofid.com"
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "CryptoAnalyzerOnline/4.1"
+    "User-Agent": "Mozilla/5.0 (Android) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120 Safari/537.36",
+    "Accept": "application/json, text/plain, */*"
 })
 
 
-# =========================================================
-# TIMEFRAMES
-# =========================================================
-
-INTERVALS = {
-    "1h": 60,
-    "4h": 240,
-    "1d": 1440,
-    "1w": 10080,
-
-    "1 ساعت": 60,
-    "4 ساعت": 240,
-    "1 روز": 1440,
-    "1 هفته": 10080
-}
+def clean_symbol(symbol: str) -> str:
+    return str(symbol).strip().replace("/", "").replace("-", "").upper()
 
 
-# =========================================================
-# SYMBOL
-# =========================================================
-
-def normalize_symbol(symbol):
-    return (
-        str(symbol)
-        .strip()
-        .upper()
-        .replace("/", "")
-        .replace("-", "")
-        .replace("_", "")
-        .replace(" ", "")
-    )
+def fa_to_en(text):
+    if text is None:
+        return ""
+    return str(text).translate(str.maketrans(
+        "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+        "01234567890123456789"
+    ))
 
 
-def normalize_interval(interval):
-    value = str(interval).strip().lower()
-
-    aliases = {
-        "1 ساعت": "1h",
-        "4 ساعت": "4h",
-        "1 روز": "1d",
-        "1 هفته": "1w"
-    }
-
-    return aliases.get(value, value)
-
-
-def get_base_symbol(symbol):
-    s = normalize_symbol(symbol)
-
-    quotes = [
-        "USDT",
-        "USDC",
-        "BUSD",
-        "USD"
-    ]
-
-    for quote in quotes:
-        if s.endswith(quote) and len(s) > len(quote):
-            return s[:-len(quote)]
-
-    return s
-
-
-# =========================================================
-# KRAKEN PAIR
-# =========================================================
-
-def get_pair_candidates(symbol):
-
-    base = get_base_symbol(symbol)
-
-    if base == "BTC":
-        bases = ["XBT", "BTC"]
-    else:
-        bases = [base]
-
-    candidates = []
-
-    for b in bases:
-        candidates.extend([
-            b + "USDT",
-            b + "USD",
-            b + "USDC"
-        ])
-
-    return list(dict.fromkeys(candidates))
-
-
-def get_asset_pairs():
-
+def get_json(url, timeout=20):
     try:
-        response = session.get(
-            f"{KRAKEN_API}/AssetPairs",
-            timeout=15
+        r = session.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ارتباط با منبع داده بورس برقرار نشد: {e}"
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail="پاسخ نامعتبر از منبع داده بورس دریافت شد."
         )
 
-        response.raise_for_status()
 
-        data = response.json()
+def search_instrument(symbol: str):
+    symbol = str(symbol).strip()
+    if not symbol:
+        raise HTTPException(400, "نماد را وارد کنید.")
 
-        if data.get("error"):
+    data = get_json(
+        f"{TSETMC_CDN}/Instrument/GetInstrumentSearch/{requests.utils.quote(symbol)}"
+    )
+    items = data.get("instrumentSearch", [])
+
+    if not items:
+        raise HTTPException(404, f"نماد «{symbol}» پیدا نشد.")
+
+    # اولویت با تطبیق دقیق نماد
+    exact = [
+        x for x in items
+        if str(x.get("lVal18AFC", "")).strip() == symbol
+    ]
+    return (exact[0] if exact else items[0]), items
+
+
+def get_history(ins_code: str):
+    data = get_json(
+        f"{TSETMC_CDN}/ClosingPrice/GetClosingPriceDailyList/{ins_code}/0"
+    )
+    rows = data.get("closingPriceDaily", [])
+
+    if not rows:
+        raise HTTPException(404, "تاریخچه قیمت این نماد در دسترس نیست.")
+
+    records = []
+    for row in rows:
+        # endpointهای TSETMC در نسخه‌های مختلف نام‌های نزدیک به هم دارند
+        date_raw = (
+            row.get("dEven")
+            or row.get("deven")
+            or row.get("date")
+            or row.get("DEven")
+        )
+
+        close = row.get("pClosing")
+        last = row.get("pDrCotVal")
+        high = row.get("priceMax")
+        low = row.get("priceMin")
+        open_price = row.get("priceFirst")
+        volume = row.get("qTotTran5J")
+        value = row.get("qTotCap")
+
+        if close is None:
+            continue
+
+        records.append({
+            "date": str(date_raw) if date_raw is not None else "",
+            "open": open_price,
+            "high": high,
+            "low": low,
+            "close": close,
+            "last": last if last is not None else close,
+            "volume": volume,
+            "value": value
+        })
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        raise HTTPException(404, "داده کافی برای تحلیل پیدا نشد.")
+
+    for c in ["open", "high", "low", "close", "last", "volume", "value"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # اگر high/low/open در بعضی روزها نبود، از close استفاده می‌کنیم
+    df["high"] = df["high"].fillna(df["close"])
+    df["low"] = df["low"].fillna(df["close"])
+    df["open"] = df["open"].fillna(df["close"])
+
+    df = df.dropna(subset=["close"]).copy()
+
+    # قدیمی -> جدید
+    df = df.iloc[::-1].reset_index(drop=True)
+
+    # حذف تاریخ‌های تکراری
+    df = df.drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+
+    if len(df) < 60:
+        raise HTTPException(400, "برای تحلیل تکنیکال حداقل 60 روز داده لازم است.")
+
+    return df
+
+
+def get_live_info(isin: str):
+    url = (
+        f"https://webgw.tse.ir/InstrumentProvider/api/v1/"
+        f"Instrument/LiveInstrumentByIdQuery/fa"
+    )
+    try:
+        r = session.get(url, params={"InstrumentId": isin}, timeout=15)
+        if r.status_code != 200:
             return {}
-
-        return data.get("result", {})
-
+        return r.json()
     except Exception:
         return {}
 
 
-def find_kraken_pair(symbol):
-
-    candidates = get_pair_candidates(symbol)
-
-    # ابتدا مستقیماً جفت‌های رایج را امتحان می‌کنیم
-    for pair in candidates:
-
-        try:
-
-            response = session.get(
-                f"{KRAKEN_API}/OHLC",
-                params={
-                    "pair": pair,
-                    "interval": 60
-                },
-                timeout=10
-            )
-
-            if response.status_code != 200:
-                continue
-
-            data = response.json()
-
-            if not data.get("error"):
-
-                result = data.get("result", {})
-
-                if result:
-                    return pair
-
-        except Exception:
-            continue
-
-    # اگر نام مستقیم جواب نداد، AssetPairs را بررسی می‌کنیم
-    pairs = get_asset_pairs()
-
-    if not pairs:
-        return None
-
-    base = get_base_symbol(symbol)
-
-    if base == "BTC":
-        bases = {"BTC", "XBT"}
-    else:
-        bases = {base}
-
-    for key, info in pairs.items():
-
-        altname = str(
-            info.get("altname", "")
-        ).upper()
-
-        wsname = str(
-            info.get("wsname", "")
-        ).upper()
-
-        text = altname + " " + wsname
-
-        for b in bases:
-
-            if (
-                b + "USD" in text
-                or
-                b + "USDT" in text
-                or
-                b + "/USD" in text
-                or
-                b + "/USDT" in text
-            ):
-                return key
-
-    return None
-
-
-# =========================================================
-# OHLC DATA
-# =========================================================
-
-def get_ohlc(symbol, interval):
-
-    interval = normalize_interval(interval)
-
-    if interval not in INTERVALS:
-
-        raise HTTPException(
-            400,
-            "تایم‌فریم معتبر نیست. "
-            "از 1 ساعت، 4 ساعت، 1 روز یا 1 هفته استفاده کنید."
-        )
-
-    kraken_interval = INTERVALS[interval]
-
-    pair = find_kraken_pair(symbol)
-
-    if not pair:
-
-        raise HTTPException(
-            404,
-            f"جفت معاملاتی {symbol} در Kraken پیدا نشد."
-        )
-
+def get_instrument_info(ins_code: str):
     try:
-
-        response = session.get(
-            f"{KRAKEN_API}/OHLC",
-            params={
-                "pair": pair,
-                "interval": kraken_interval
-            },
-            timeout=20
+        data = get_json(
+            f"{TSETMC_CDN}/Instrument/GetInstrumentInfo/{ins_code}",
+            timeout=15
         )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-    except requests.RequestException:
-
-        raise HTTPException(
-            502,
-            "ارتباط با Kraken برقرار نشد."
-        )
-
-    if data.get("error"):
-
-        raise HTTPException(
-            400,
-            "Kraken خطا برگرداند: "
-            + " | ".join(
-                str(x)
-                for x in data["error"]
-            )
-        )
-
-    result = data.get("result", {})
-
-    rows = None
-
-    for key, value in result.items():
-
-        if key != "last":
-            rows = value
-            break
-
-    if not rows:
-
-        raise HTTPException(
-            400,
-            "Kraken برای این ارز داده‌ای برنگرداند."
-        )
-
-    df = pd.DataFrame(
-        rows,
-        columns=[
-            "time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "vwap",
-            "volume",
-            "count"
-        ]
-    )
-
-    numeric_columns = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume"
-    ]
-
-    for column in numeric_columns:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
-
-    df["time"] = pd.to_datetime(
-        df["time"],
-        unit="s",
-        utc=True
-    )
-
-    df = (
-        df
-        .dropna()
-        .reset_index(drop=True)
-    )
-
-    if len(df) < 60:
-
-        raise HTTPException(
-            400,
-            "داده کافی برای تحلیل این ارز وجود ندارد."
-        )
-
-    return df, pair
+        return data.get("instrumentInfo", data)
+    except Exception:
+        return {}
 
 
-# =========================================================
-# INDICATORS
-# =========================================================
-
-def ema(series, period):
-
-    return series.ewm(
-        span=period,
-        adjust=False
-    ).mean()
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
 
 
-def rsi(series, period=14):
-
-    delta = series.diff()
-
+def rsi(s, n=14):
+    delta = s.diff()
     gain = delta.clip(lower=0)
-
     loss = -delta.clip(upper=0)
 
     avg_gain = gain.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
+        alpha=1 / n, adjust=False, min_periods=n
     ).mean()
-
     avg_loss = loss.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
+        alpha=1 / n, adjust=False, min_periods=n
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(
-        0,
-        float("nan")
-    )
-
-    result = 100 - (
-        100 / (1 + rs)
-    )
-
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    result = 100 - (100 / (1 + rs))
     return result.fillna(50)
 
 
-def atr(df, period=14):
+def atr(df, n=14):
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
 
-    previous_close = df["close"].shift(1)
-
-    true_range = pd.concat(
-        [
-            df["high"] - df["low"],
-
-            (
-                df["high"] -
-                previous_close
-            ).abs(),
-
-            (
-                df["low"] -
-                previous_close
-            ).abs()
-        ],
-        axis=1
-    ).max(axis=1)
-
-    return true_range.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
+    return tr.ewm(
+        alpha=1 / n, adjust=False, min_periods=n
     ).mean()
 
 
-def add_indicators(df):
-
+def indicators(df):
     d = df.copy()
 
-    d["ema20"] = ema(
-        d["close"],
-        20
-    )
+    for n in [20, 50, 100, 200]:
+        d[f"ema{n}"] = ema(d["close"], n)
 
-    d["ema50"] = ema(
-        d["close"],
-        50
-    )
+    d["rsi"] = rsi(d["close"])
+    d["ema12"] = ema(d["close"], 12)
+    d["ema26"] = ema(d["close"], 26)
+    d["macd"] = d["ema12"] - d["ema26"]
+    d["macd_signal"] = ema(d["macd"], 9)
+    d["macd_hist"] = d["macd"] - d["macd_signal"]
+    d["atr"] = atr(d)
 
-    d["ema200"] = ema(
-        d["close"],
-        200
-    )
+    # میانگین حجم
+    d["vol20"] = d["volume"].rolling(20).mean()
 
-    d["rsi"] = rsi(
-        d["close"],
-        14
-    )
-
-    d["macd"] = (
-        ema(d["close"], 12)
-        -
-        ema(d["close"], 26)
-    )
-
-    d["macd_signal"] = ema(
-        d["macd"],
-        9
-    )
-
-    d["macd_hist"] = (
-        d["macd"]
-        -
-        d["macd_signal"]
-    )
-
-    d["atr"] = atr(
-        d,
-        14
-    )
-    # --------------------------
-    # VOLUME ANALYSIS
-    # --------------------------
-
-    d["volume_ma20"] = d["volume"].rolling(20).mean()
-
-    d["volume_ratio"] = (
-        d["volume"] / d["volume_ma20"]
-    )
-    return (
-        d
-        .dropna()
-        .reset_index(drop=True)
-    )
+    return d.dropna(subset=[
+        "ema20", "ema50", "ema200", "rsi", "macd", "macd_signal", "atr"
+    ]).reset_index(drop=True)
 
 
-# =========================================================
-# ANALYSIS
-# =========================================================
+def round_num(v, digits=2):
+    try:
+        if v is None or not math.isfinite(float(v)):
+            return None
+        return round(float(v), digits)
+    except Exception:
+        return None
 
-def analyze(df, symbol=None):
 
-    d = add_indicators(df)
-
-    if len(d) < 10:
-
-        raise HTTPException(
-            400,
-            "داده کافی برای تحلیل وجود ندارد."
-        )
+def analyze_stock(df):
+    d = indicators(df)
+    if len(d) < 30:
+        raise HTTPException(400, "داده کافی برای تحلیل تکنیکال وجود ندارد.")
 
     x = d.iloc[-1]
-
     price = float(x["close"])
-    # =========================
-# STAGE 6 — MTF CONFIRMATION
-# =========================
+    atr_value = float(x["atr"])
+    rv = float(x["rsi"])
 
-    mtf_trends = get_mtf_trend(symbol) if symbol else {
-        "4h": "UNKNOWN",
-        "1d": "UNKNOWN"
-    }
+    score = 0
+    reasons = []
 
-    current_atr = float(x["atr"])
-    current_rsi = float(x["rsi"])
-score = 0
-reasons = []
-
-# -------------------------
-# SMART SCORING ENGINE
-# -------------------------
-
-# EMA20 / Price
-if price > x["ema20"]:
-    score += 1
-    reasons.append("قیمت بالای EMA20 است.")
-else:
-    score -= 1
-    reasons.append("قیمت زیر EMA20 است.")
-
-# EMA20 / EMA50
-if x["ema20"] > x["ema50"]:
-    score += 1
-    reasons.append("EMA20 بالای EMA50 است.")
-else:
-    score -= 1
-    reasons.append("EMA20 زیر EMA50 است.")
-
-# EMA50 / EMA200
-if x["ema50"] > x["ema200"]:
-    score += 1
-    reasons.append("EMA50 بالای EMA200 است.")
-else:
-    score -= 1
-    reasons.append("EMA50 زیر EMA200 است.")
-
-# RSI
-if current_rsi >= 60:
-    score += 1
-    reasons.append("RSI قدرت خریداران را تأیید می‌کند.")
-elif current_rsi <= 40:
-    score -= 1
-    reasons.append("RSI قدرت فروشندگان را تأیید می‌کند.")
-else:
-    reasons.append("RSI در محدوده خنثی است.")
-
-# MACD
-if x["macd_hist"] > 0:
-    score += 1
-    reasons.append("MACD مثبت است.")
-else:
-    score -= 1
-    reasons.append("MACD منفی است.")
-
-# Volume confirmation
-volume_ratio = float(x.get("volume_ratio", 1))
-
-if volume_ratio >= 1.20:
-    if score > 0:
+    # روند
+    if price > x["ema20"]:
         score += 1
-        reasons.append("حجم معاملات ورود قدرت را تأیید می‌کند.")
-    elif score < 0:
+        reasons.append("قیمت بالای EMA20 است.")
+    else:
         score -= 1
-        reasons.append("حجم معاملات فشار فروش را تأیید می‌کند.")
-else:
-    reasons.append("حجم معاملات تأیید قدرتمندی نمی‌دهد.")
+        reasons.append("قیمت زیر EMA20 است.")
 
-# =========================
-# STAGE 6 — MTF SCORE
-# =========================
+    if x["ema20"] > x["ema50"]:
+        score += 1
+        reasons.append("EMA20 بالای EMA50 است.")
+    else:
+        score -= 1
+        reasons.append("EMA20 زیر EMA50 است.")
 
-if mtf_trends["4h"] == "BULLISH":
-    score += 1
-    reasons.append("روند 4 ساعته صعودی است.")
+    if x["ema50"] > x["ema200"]:
+        score += 1
+        reasons.append("EMA50 بالای EMA200 است.")
+    else:
+        score -= 1
+        reasons.append("EMA50 زیر EMA200 است.")
 
-elif mtf_trends["4h"] == "BEARISH":
-    score -= 1
-    reasons.append("روند 4 ساعته نزولی است.")
+    # RSI
+    if 55 <= rv < 70:
+        score += 1
+        reasons.append("RSI در محدوده قدرت خریداران است.")
+    elif rv > 75:
+        score -= 1
+        reasons.append("RSI بسیار بالا و مستعد اصلاح است.")
+    elif rv < 30:
+        score += 1
+        reasons.append("RSI در محدوده اشباع فروش است.")
+    elif rv < 45:
+        score -= 1
+        reasons.append("RSI ضعیف است.")
 
-if mtf_trends["1d"] == "BULLISH":
-    score += 1
-    reasons.append("روند روزانه صعودی است.")
+    # MACD
+    if x["macd_hist"] > 0:
+        score += 1
+        reasons.append("هیستوگرام MACD مثبت است.")
+    else:
+        score -= 1
+        reasons.append("هیستوگرام MACD منفی است.")
 
-elif mtf_trends["1d"] == "BEARISH":
-    score -= 1
-    reasons.append("روند روزانه نزولی است.")# محدود کردن امتیاز
-score = max(-8, min(8, score))
-    
-# -----------------------
-# SMART SIGNAL ENGINE
-# -----------------------
+    # حجم
+    if pd.notna(x["vol20"]) and x["volume"] > x["vol20"] * 1.2:
+        if x["close"] >= x["open"]:
+            score += 1
+            reasons.append("حجم معاملات بالاتر از میانگین و کندل مثبت است.")
+        else:
+            score -= 1
+            reasons.append("حجم بالا همراه با فشار فروش دیده می‌شود.")
 
-signal = "NO TRADE"
-entry = price
+    support = float(d.tail(60)["low"].min())
+    resistance = float(d.tail(60)["high"].max())
 
-# SMART ENTRY ZONE
-entry_low = None
-entry_high = None
+    # سطوح نزدیک‌تر برای ورود/خروج
+    recent_low = float(d.tail(20)["low"].min())
+    recent_high = float(d.tail(20)["high"].max())
 
-stop_loss = None
-tp1 = None
-tp2 = None
-tp3 = None
-risk = None
-# -----------------------
-# LONG
-# -----------------------
-# =========================
-# STAGE 7 — WEAK SIGNAL FILTER
-# =========================
-
-if score >= 3:
-    # فیلتر LONG
-    if (
-        mtf_trends["4h"] == "BEARISH"
-        and mtf_trends["1d"] == "BEARISH"
-    ):
-        score = 0
-        reasons.append(
-            "LONG رد شد: روند 4 ساعته و روزانه نزولی هستند."
-        )
-
-    elif current_rsi >= 75:
-        score = 0
-        reasons.append(
-            "LONG رد شد: RSI بیش از حد بالا است."
-        )
-
-elif score <= -3:
-    # فیلتر SHORT
-    if (
-        mtf_trends["4h"] == "BULLISH"
-        and mtf_trends["1d"] == "BULLISH"
-    ):
-        score = 0
-        reasons.append(
-            "SHORT رد شد: روند 4 ساعته و روزانه صعودی هستند."
-        )
-
-    elif current_rsi <= 25:
-        score = 0
-        reasons.append(
-            "SHORT رد شد: RSI بیش از حد پایین است."
-        )
-if score >= 3:
-    if score >= 3:
-        signal = "LONG"
+    if score >= 4:
+        signal = "BUY / LONG BIAS"
         entry = price
 
-        # SMART LONG ENTRY ZONE
-        entry_low = min(price, float(x["ema20"])) - (0.25 * current_atr)
-        entry_high = max(price, float(x["ema20"])) + (0.15 * current_atr)
+        # حد ضرر ترکیبی: زیر حمایت اخیر یا 1.5 ATR
+        sl = min(recent_low * 0.985, price - 1.5 * atr_value)
+        if sl >= entry:
+            sl = entry - 1.5 * atr_value
 
-        # جلوگیری از ورود بیش از حد دور
-        entry_low = max(entry_low, price - (1.0 * current_atr))
-        entry_high = min(entry_high, price + (0.5 * current_atr))
-
-        # حد ضرر ترکیبی ATR + حمایت
-        atr_stop = price - (1.5 * current_atr)
-
-        if support is not None:
-            stop_loss = min(support, atr_stop)
-        else:
-            stop_loss = atr_stop
-
-        # جلوگیری از حد ضرر نامعتبر
-        if stop_loss >= entry:
-            stop_loss = entry - (1.5 * current_atr)
-
-        risk = max(
-            entry - stop_loss,
-            current_atr * 0.5
-        )
-
-        # اهداف اولیه
-        raw_tp1 = entry + (1.5 * risk)
-        raw_tp2 = entry + (2.5 * risk)
-        raw_tp3 = entry + (3.5 * risk)
-
-        # اگر مقاومت معتبر وجود داشت، TP1 روی مقاومت
-        if resistance is not None and resistance > entry:
-            tp1 = resistance
-        else:
-            tp1 = raw_tp1
-
-        # جلوگیری از نزدیک بودن TP2 و TP3
-        tp2 = max(raw_tp2, tp1 + risk)
-        tp3 = max(raw_tp3, tp2 + risk)
-
-        reasons.append(
-            "برای LONG مجموع شرایط تکنیکال تأیید شده است."
-        )
-    # --------------------
-    # SHORT
-    # --------------------
+        risk = max(entry - sl, atr_value * 0.5)
+        tp1 = entry + 1.5 * risk
+        tp2 = entry + 2.5 * risk
+        tp3 = entry + 3.5 * risk
 
     elif score <= -3:
-        signal = "SHORT"
+        signal = "SELL / EXIT BIAS"
         entry = price
 
-        # SMART SHORT ENTRY ZONE
-        entry_low = min(price, float(x["ema20"])) - (0.15 * current_atr)
-        entry_high = max(price, float(x["ema20"])) + (0.25 * current_atr)
+        sl = max(recent_high * 1.015, price + 1.5 * atr_value)
+        if sl <= entry:
+            sl = entry + 1.5 * atr_value
 
-        # جلوگیری از ورود بیش از حد دور
-        entry_low = max(entry_low, price - (0.5 * current_atr))
-        entry_high = min(entry_high, price + (1.0 * current_atr))
+        risk = max(sl - entry, atr_value * 0.5)
+        tp1 = entry - 1.5 * risk
+        tp2 = entry - 2.5 * risk
+        tp3 = entry - 3.5 * risk
 
-        # حد ضرر ATR
-        atr_stop = price + (1.5 * current_atr)
+    else:
+        signal = "WAIT"
+        entry = price
+        sl = tp1 = tp2 = tp3 = None
+        risk = None
 
-        if resistance is not None:
-            stop_loss = max(resistance, atr_stop)
-        else:
-            stop_loss = atr_stop
-
-        # جلوگیری از حد ضرر نامعتبر
-        if stop_loss <= entry:
-            stop_loss = entry + (1.5 * current_atr)
-
-        risk = max(
-            stop_loss - entry,
-            current_atr * 0.5
-        )
-
-        # اهداف اولیه
-        raw_tp1 = entry - (1.5 * risk)
-        raw_tp2 = entry - (2.5 * risk)
-        raw_tp3 = entry - (3.5 * risk)
-
-        # استفاده از حمایت به عنوان TP1
-        if support is not None and support < entry:
-            tp1 = support
-        else:
-            tp1 = raw_tp1
-
-        # جلوگیری از نزدیک بودن TP2 و TP3
-        tp2 = min(raw_tp2, tp1 - risk)
-        tp3 = min(raw_tp3, tp2 - risk)
-
-        reasons.append(
-            "برای SHORT مجموع شرایط تکنیکال تأیید شده است."
-        )
-# -----------------------
-# NO TRADE
-# -----------------------
-
-else:
-
-    signal = "NO TRADE"
-    entry = price
-
-    stop_loss = None
-    tp1 = None
-    tp2 = None
-    tp3 = None
-    risk = None
-
-    reasons.append(
-        "شرایط کافی برای ورود به معامله وجود ندارد."
-    )
-
-# ----------------
-# CONFIDENCE ENGINE
-# ----------------
-
-# تبدیل امتیاز فعلی به بازه 0 تا 100
-confidence = round(
-    max(
-        0,
-        min(
-            100,
-            ((score + 6) / 12) * 100
-        )
-    )
-)
-
-# تقویت Confidence بر اساس RSI
-if signal == "LONG":
-    if 50 <= current_rsi <= 65:
-        confidence += 5
-    elif current_rsi > 70:
-        confidence -= 5
-
-elif signal == "SHORT":
-    if 35 <= current_rsi <= 50:
-        confidence += 5
-    elif current_rsi < 30:
-        confidence -= 5
-
-# تقویت بر اساس حجم
-if volume_ratio >= 1.20:
-    confidence += 5
-
-# محدود کردن به 0 تا 100
-confidence = max(
-    0,
-    min(100, confidence)
-)
-
-confidence = round(confidence)
-# ------------------------
-# RISK / REWARD
-# ------------------------
-
-    rr1 = None
-    rr2 = None
-    rr3 = None
-
-    if signal == "LONG" and risk is not None and risk > 0:
-        rr1 = round(
-            (tp1 - entry) / risk,
-            2
-        )
-        rr2 = round(
-            (tp2 - entry) / risk,
-            2
-        )
-
-        rr3 = round(
-            (tp3 - entry) / risk,
-            2
-        )
-
-    elif signal == "SHORT" and risk is not None and risk > 0:
-        rr1 = round(
-            (entry - tp1) / risk,
-            2
-        )
-
-        rr2 = round(
-            (entry - tp2) / risk,
-            2
-        )
-
-        rr3 = round(
-            (entry - tp3) / risk,
-            2
-        )
+    rr = None
+    if risk and risk > 0:
+        rr = abs(tp2 - entry) / risk
 
     return {
         "signal": signal,
-        "price": rnd(price),
-        "entry_low": rnd(entry_low),
-        "entry_high": rnd(entry_high),
-        "entry": rnd(entry),
-        "stop_loss": rnd(stop_loss),
-        "take_profit_1": rnd(tp1),
-        "take_profit_2": rnd(tp2),
-        "take_profit_3": rnd(tp3),
-        "risk": rnd(risk),
-        "confidence": confidence,
-        "trend_strength": trend_strength,
-        "rr1": rr1,
-        "rr2": rr2,
-        "rr3": rr3,
-        "rsi": round(current_rsi, 2),
-        "ema20": rnd(x["ema20"]),
-        "ema50": rnd(x["ema50"]),
-        "ema200": rnd(x["ema200"]),
-        "macd": rnd(x["macd"]),
-        "macd_signal": rnd(x["macd_signal"]),
-        "atr": rnd(current_atr),
-        "support": rnd(support),
-        "resistance": rnd(resistance),
-        "score": score,
+        "price": round_num(price),
+        "entry": round_num(entry),
+        "stop_loss": round_num(sl),
+        "take_profit_1": round_num(tp1),
+        "take_profit_2": round_num(tp2),
+        "take_profit_3": round_num(tp3),
+        "risk_reward_tp2": round_num(rr, 2),
+        "rsi": round_num(rv, 2),
+        "ema20": round_num(x["ema20"]),
+        "ema50": round_num(x["ema50"]),
+        "ema200": round_num(x["ema200"]),
+        "macd": round_num(x["macd"], 4),
+        "macd_signal": round_num(x["macd_signal"], 4),
+        "atr": round_num(atr_value),
+        "support": round_num(support),
+        "resistance": round_num(resistance),
+        "recent_support": round_num(recent_low),
+        "recent_resistance": round_num(recent_high),
+        "score": int(score),
         "reasons": reasons
     }
-    # -------------------------
-    # Rounding
-    # -------------------------
-def rnd(value):
-    if value is None:
-        return None
-
-    try:
-        value = float(value)
-
-        if not math.isfinite(value):
-            return None
-
-        return round(value, 8)
-
-    except Exception:
-        return None
-# ============================================================
-# MULTI TIMEFRAME ANALYSIS
-# ============================================================
 
 
-def get_multi_timeframe_analysis(symbol):
-    timeframes = {
-        "1h": "1 ساعت",
-        "4h": "4 ساعت",
-        "1d": "1 روز"
-    }
-
-    result = {}
-
-    for interval, title in timeframes.items():
-        try:
-            df, pair = get_ohlc(symbol, interval)
-            data = analyze(df, symbol)
-
-            signal = data.get("signal", "NO TRADE")
-            score = data.get("score", 0)
-
-            if score >= 3:
-                trend = "صعودی"
-            elif score <= -3:
-                trend = "نزولی"
-            else:
-                trend = "خنثی"
-
-            result[interval] = {
-                "title": title,
-                "signal": signal,
-                "trend": trend,
-                "score": score,
-                "confidence": data.get("confidence", 0),
-                "rsi": data.get("rsi")
-            }
-
-        except Exception as e:
-            result[interval] = {
-                "title": title,
-                "signal": "NO TRADE",
-                "trend": "نامشخص",
-                "score": 0,
-                "confidence": 0,
-                "rsi": None,
-                "error": str(e)
-
-            }
-    # --------------------------------------------------------
-    # FINAL MULTI-TIMEFRAME DECISION
-    # --------------------------------------------------------
-
-    h1 = result.get("1h", {})
-    h4 = result.get("4h", {})
-    d1 = result.get("1d", {})
-
-    signals = [
-        h1.get("signal"),
-        h4.get("signal"),
-        d1.get("signal")
-    ]
-
-    if h1.get("signal") == "LONG" and h4.get("signal") == "LONG":
-        final_trend = "LONG"
-
-    elif h1.get("signal") == "SHORT" and h4.get("signal") == "SHORT":
-        final_trend = "SHORT"
-
-    else:
-        final_trend = "NO TRADE"
-
-    # --------------------------------------------------------
-    # ALIGNMENT SCORE
-    # --------------------------------------------------------
-
-    alignment = 0
-
-    if h1.get("signal") == h4.get("signal"):
-        if h1.get("signal") in ["LONG", "SHORT"]:
-            alignment += 40
-
-    if h4.get("signal") == d1.get("signal"):
-        if h4.get("signal") in ["LONG", "SHORT"]:
-            alignment += 30
-
-    if d1.get("signal") == h1.get("signal"):
-        if d1.get("signal") in ["LONG", "SHORT"]:
-            alignment += 30
-
-    # --------------------------------------------------------
-    # FINAL RESULT
-    # --------------------------------------------------------
-
-    return {
-        "1h": h1,
-        "4h": h4,
-        "1d": d1,
-        "final_signal": final_trend,
-        "alignment": alignment
-    }# =================================================
-# STAGE 8 — BACKTEST ENGINE
-# =================================================
-
-def backtest_strategy(df):
-    """
-    بک‌تست پایه استراتژی روی داده‌های تاریخی
-    """
-
-    d = add_indicators(df).copy()
-    d = d.dropna().reset_index(drop=True)
-
-    trades = []
-    equity = 0.0
-    peak_equity = 0.0
-    max_drawdown = 0.0
-
-    wins = 0
-    losses = 0
-    longs = 0
-    shorts = 0
-
-    # حداقل داده مورد نیاز
-    if len(d) < 50:
+def backtest(df, lookback=100):
+    d = indicators(df).copy()
+    if len(d) < lookback + 10:
         return {
-            "status": "error",
-            "message": "داده تاریخی کافی نیست."
+            "trades": 0,
+            "win_rate": None,
+            "message": "داده کافی برای بک‌تست وجود ندارد."
         }
 
-    for i in range(50, len(d) - 1):
+    # بک‌تست ساده و غیرتضمینی:
+    # ورود وقتی امتیاز >=4، حدضرر 1.5 ATR و هدف 2R.
+    wins = 0
+    losses = 0
+    trades = 0
 
-        x = d.iloc[i]
+    start = max(210, len(d) - lookback)
 
-        price = float(x["close"])
-        atr = float(x["atr"])
-        rsi = float(x["rsi"])
-
-        if atr <= 0:
-            continue
+    for i in range(start, len(d) - 5):
+        row = d.iloc[i]
+        price = float(row["close"])
+        a = float(row["atr"])
 
         score = 0
+        score += 1 if price > row["ema20"] else -1
+        score += 1 if row["ema20"] > row["ema50"] else -1
+        score += 1 if row["ema50"] > row["ema200"] else -1
+        score += 1 if row["rsi"] >= 55 else (-1 if row["rsi"] <= 45 else 0)
+        score += 1 if row["macd_hist"] > 0 else -1
 
-        # EMA20 / Price
-        if price > float(x["ema20"]):
-            score += 1
-        else:
-            score -= 1
-
-        # EMA20 / EMA50
-        if float(x["ema20"]) > float(x["ema50"]):
-            score += 1
-        else:
-            score -= 1
-
-        # EMA50 / EMA200
-        if float(x["ema50"]) > float(x["ema200"]):
-            score += 1
-        else:
-            score -= 1
-
-        # RSI
-        if rsi >= 60:
-            score += 1
-        elif rsi <= 40:
-            score -= 1
-
-        # MACD
-        if float(x["macd_hist"]) > 0:
-            score += 1
-        else:
-            score -= 1
-
-        # Volume
-        volume_ratio = float(
-            x.get("volume_ratio", 1)
-        )
-
-        if volume_ratio >= 1.20:
-            if score > 0:
-                score += 1
-            elif score < 0:
-                score -= 1
-
-        # محدود کردن امتیاز
-        score = max(-6, min(6, score))
-
-        signal = None
-
-        if score >= 3:
-            signal = "LONG"
-
-        elif score <= -3:
-            signal = "SHORT"
-
-        if signal is None:
+        if score < 4:
             continue
 
-        # ورود در کندل بعدی
-        entry_row = d.iloc[i + 1]
-        entry = float(entry_row["open"])
+        entry = price
+        sl = entry - 1.5 * a
+        tp = entry + 3.0 * a
 
-        risk = max(
-            atr * 0.75,
-            atr * 0.5
-        )
+        trades += 1
 
-        if signal == "LONG":
-            longs += 1
+        future = d.iloc[i + 1:i + 6]
+        result = None
 
-            stop_loss = entry - risk
-            take_profit = entry + (1.5 * risk)
+        for _, f in future.iterrows():
+            if f["low"] <= sl:
+                result = "loss"
+                break
+            if f["high"] >= tp:
+                result = "win"
+                break
 
-        else:
-            shorts += 1
-
-            stop_loss = entry + risk
-            take_profit = entry - (1.5 * risk)
-
-        result = "LOSS"
-        exit_price = float(
-            d.iloc[-1]["close"]
-        )
-
-        # بررسی کندل‌های بعدی
-        for j in range(i + 1, len(d)):
-
-            candle = d.iloc[j]
-
-            high = float(candle["high"])
-            low = float(candle["low"])
-
-            if signal == "LONG":
-
-                if low <= stop_loss:
-                    exit_price = stop_loss
-                    result = "LOSS"
-                    break
-
-                if high >= take_profit:
-                    exit_price = take_profit
-                    result = "WIN"
-                    break
-
-            else:
-
-                if high >= stop_loss:
-                    exit_price = stop_loss
-                    result = "LOSS"
-                    break
-
-                if low <= take_profit:
-                    exit_price = take_profit
-                    result = "WIN"
-                    break
-
-        if signal == "LONG":
-            r_multiple = (
-                exit_price - entry
-            ) / risk
-
-        else:
-            r_multiple = (
-                entry - exit_price
-            ) / risk
-
-        equity += r_multiple
-
-        peak_equity = max(
-            peak_equity,
-            equity
-        )
-
-        drawdown = peak_equity - equity
-
-        max_drawdown = max(
-            max_drawdown,
-            drawdown
-        )
-
-        if result == "WIN":
+        if result == "win":
             wins += 1
-        else:
+        elif result == "loss":
             losses += 1
 
-        trades.append({
-            "signal": signal,
-            "entry": round(entry, 8),
-            "exit": round(exit_price, 8),
-            "result": result,
-            "r": round(r_multiple, 2)
-        })
-
-    total_trades = wins + losses
-
-    win_rate = (
-        (wins / total_trades) * 100
-        if total_trades > 0
-        else 0
-    )
+    decided = wins + losses
+    win_rate = (wins / decided * 100) if decided else None
 
     return {
-        "status": "ok",
-        "total_trades": total_trades,
-        "long_trades": longs,
-        "short_trades": shorts,
+        "trades": trades,
         "wins": wins,
         "losses": losses,
-        "win_rate": round(win_rate, 2),
-        "total_r": round(equity, 2),
-        "max_drawdown_r": round(max_drawdown, 2),
-        "trades": trades
+        "win_rate": round_num(win_rate, 2),
+        "lookback": lookback,
+        "message": "بک‌تست ساده است و هزینه معاملات، صف، دامنه نوسان و لغزش قیمت را کامل مدل نمی‌کند."
     }
 
-
-# =================================================
-# BACKTEST API
-# =================================================
-
-@app.get("/backtest")
-def run_backtest(
-    symbol: str = Query("BTCUSDT"),
-    interval: str = Query("1h")
-):
-
-    symbol = normalize_symbol(symbol)
-    interval = normalize_interval(interval)
-
-    df, pair = get_ohlc(
-        symbol,
-        interval
-    )
-
-    result = backtest_strategy(df)
-
-    result["symbol"] = symbol
-    result["pair"] = pair
-    result["interval"] = interval
-    result["data_source"] = "Kraken"
-
-    return result
-# =========================================================
-# HEALTH
-# =========================================================
 
 @app.get("/health")
 def health():
-
     return {
         "status": "ok",
-        "service": "Crypto Analyzer Online",
-        "version": "4.1.0",
-        "data_source": "Kraken"
+        "service": "Iran Stock Analyzer / EasyTrader",
+        "version": "3.0.0",
+        "data_source": "TSETMC",
+        "broker": "Mofid EasyTrader"
     }
 
 
-# =========================================================
-# ANALYZE API
-# =========================================================
+@app.get("/symbols")
+def symbols(q: str = Query("استیل")):
+    _, items = search_instrument(q)
+    return {
+        "query": q,
+        "results": items[:20]
+    }
+
 
 @app.get("/analyze")
-def analyze_market(
-    symbol: str = Query("BTCUSDT"),
-    interval: str = Query("1h")
+def analyze_market(symbol: str = Query("استیل")):
+    item, _ = search_instrument(symbol)
+
+    ins_code = item.get("insCode")
+    isin = item.get("cIsin")
+    ticker = item.get("lVal18AFC", symbol)
+    company = item.get("lVal30", "")
+
+    if not ins_code:
+        raise HTTPException(404, "شناسه نماد پیدا نشد.")
+
+    df = get_history(ins_code)
+    result = analyze_stock(df)
+
+    fundamental = get_instrument_info(ins_code)
+
+    return {
+        **result,
+        "symbol": ticker,
+        "company": company,
+        "isin": isin,
+        "ins_code": ins_code,
+        "fundamental_raw": fundamental,
+        "easytrader_url": EASYTRADER_URL
+    }
+
+
+@app.get("/backtest")
+def run_backtest(
+    symbol: str = Query("استیل"),
+    lookback: int = Query(100, ge=30, le=1000)
 ):
+    item, _ = search_instrument(symbol)
+    ins_code = item.get("insCode")
 
-    symbol = normalize_symbol(
-        symbol
-    )
+    if not ins_code:
+        raise HTTPException(404, "شناسه نماد پیدا نشد.")
 
-    interval = normalize_interval(
-        interval
-    )
+    df = get_history(ins_code)
+    result = backtest(df, lookback)
 
-    df, pair = get_ohlc(
-        symbol,
-        interval
-    )
+    return {
+        "symbol": item.get("lVal18AFC", symbol),
+        **result
+    }
 
-    result = analyze(df, symbol)
-
-    result["symbol"] = symbol
-
-    result["pair"] = pair
-
-    result["interval"] = interval
-    result["mtf"] = get_mtf_analysis(symbol)
-    result["data_source"] = "Kraken"
-    # MULTI TIMEFRAME
-    result["multi_timeframe"] = get_multi_timeframe_analysis(symbol)
-    return result
-
-
-# =========================================================
-# FRONTEND
-# =========================================================
 
 HTML = """
 <!doctype html>
-
 <html lang="fa" dir="rtl">
-
 <head>
-
 <meta charset="utf-8">
-
-<meta
-name="viewport"
-content="width=device-width,initial-scale=1"
->
-
-<title>
-Crypto Analyzer Online
-</title>
-
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>تحلیل‌گر بورس ایران | ایزی‌تریدر</title>
 <style>
-
-*{
-box-sizing:border-box;
-}
-
-body{
-
-margin:0;
-
-min-height:100vh;
-
-background:
-radial-gradient(
-circle at top,
-#172554,
-#07101f 55%,
-#020617
-);
-
-color:white;
-
-font-family:
-Tahoma,
-Arial,
-sans-serif;
-
-}
-
-.wrap{
-
-max-width:800px;
-
-margin:auto;
-
-padding:25px 16px;
-
-}
-
-.card{
-
-background:
-rgba(17,29,50,.95);
-
-border:
-1px solid rgba(255,255,255,.08);
-
-padding:28px;
-
-border-radius:28px;
-
-box-shadow:
-0 20px 60px rgba(0,0,0,.4);
-
-}
-
-h1{
-
-direction:ltr;
-
-text-align:left;
-
-font-size:30px;
-
-margin-top:0;
-
-}
-
-.sub{
-
-font-size:20px;
-
-color:#cbd5e1;
-
-margin-bottom:28px;
-
-}
-
-label{
-
-display:block;
-
-margin-top:15px;
-
-margin-bottom:6px;
-
-color:#cbd5e1;
-
-}
-
-input,
-select,
-button{
-
-width:100%;
-
-padding:16px;
-
-border:0;
-
-border-radius:14px;
-
-font-size:17px;
-
-margin:7px 0;
-
-}
-
-input,
-select{
-
-background:#081426;
-
-color:white;
-
-border:
-1px solid #263751;
-
-}
-
-button{
-
-background:#16a34a;
-
-color:white;
-
-font-weight:bold;
-
-cursor:pointer;
-
-}
-
-button:disabled{
-
-opacity:.6;
-
-cursor:wait;
-
-}
-
-.result{
-
-margin-top:20px;
-
-background:#050d1b;
-
-padding:20px;
-
-border-radius:18px;
-
-line-height:2;
-
-}
-
-.grid{
-
-display:grid;
-
-grid-template-columns:
-1fr 1fr;
-
-gap:10px;
-
-}
-
-.box{
-
-background:#17243a;
-
-padding:12px;
-
-border-radius:13px;
-
-}
-
-.signal{
-
-font-size:30px;
-
-font-weight:bold;
-
-text-align:center;
-
-padding:12px;
-
-margin-bottom:15px;
-
-}
-
-.info{
-
-color:#94a3b8;
-
-font-size:13px;
-
-margin-top:18px;
-
-}
-
-@media(max-width:600px){
-
-h1{
-font-size:24px;
-}
-
-.grid{
-grid-template-columns:1fr 1fr;
-}
-
-}
-
+body{margin:0;background:#07101f;color:#fff;font-family:Tahoma,Arial,sans-serif}
+.wrap{max-width:760px;margin:20px auto;padding:14px}
+.card{background:#111d32;padding:22px;border-radius:24px}
+h1{margin-top:0}
+.sub{color:#b9c4d6;margin-bottom:20px}
+input,button{width:100%;box-sizing:border-box;padding:15px;border:0;border-radius:13px;font-size:17px;margin:7px 0}
+input{background:#0b1424;color:#fff;border:1px solid #30405a}
+button{background:#16a34a;color:#fff;font-weight:bold}
+.secondary{background:#334155}
+.result{margin-top:18px;background:#050d1b;padding:16px;border-radius:16px;line-height:2}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.box{background:#17243a;padding:11px;border-radius:12px}
+.good{color:#39d98a}.bad{color:#ff7187}.warn{color:#ffd166}
+a{display:block;text-align:center;color:#fff;text-decoration:none}
+.small{font-size:12px;color:#91a0b7}
+@media(max-width:600px){.wrap{padding:8px}.card{padding:16px}}
 </style>
-
 </head>
-
 <body>
-
 <div class="wrap">
-
 <div class="card">
+<h1>📈 تحلیل‌گر بورس ایران</h1>
+<div class="sub">اتصال داده بازار ایران + تحلیل تکنیکال + ورود/حدضرر/حدسود + بک‌تست</div>
 
-<h1>
-📊 Crypto Analyzer Online
-</h1>
+<label>نماد</label>
+<input id="symbol" value="استیل" placeholder="مثلاً استیل، فولاد، شستا">
 
-<div class="sub">
-تحلیل آنلاین بازار ارز دیجیتال
+<button onclick="analyze()">🔍 تحلیل نماد</button>
+<button class="secondary" onclick="backtest()">🧪 بک‌تست</button>
+<a href="https://easytrader.emofid.com" target="_blank">
+<button class="secondary">💼 باز کردن ایزی‌تریدر</button>
+</a>
+
+<div id="result" class="result">آماده تحلیل...</div>
 </div>
-
-<label>
-نماد ارز
-</label>
-
-<input
-id="symbol"
-value="BTCUSDT"
-placeholder="مثلاً BTCUSDT"
-/>
-
-<label>
-تایم‌فریم
-</label>
-
-<select id="interval">
-
-<option value="1h">
-1 ساعت
-</option>
-
-<option value="4h">
-4 ساعت
-</option>
-
-<option value="1d">
-1 روز
-</option>
-
-<option value="1w">
-1 هفته
-</option>
-
-</select>
-
-<button
-id="btn"
-onclick="runAnalysis()"
->
-🔍 تحلیل بازار
-</button>
-
-<div id="result">
-
-آماده تحلیل...
-
 </div>
-
-</div>
-
-</div>
-
 
 <script>
+const f=v=>v==null?"—":Number(v).toLocaleString("fa-IR",{maximumFractionDigits:2});
 
-function formatNumber(value){
-
-if(
-value === null ||
-value === undefined
-){
-
-return "-";
-
+function analyze(){
+ const s=document.getElementById("symbol").value.trim();
+ const o=document.getElementById("result");
+ o.innerHTML="⏳ در حال دریافت اطلاعات نماد و تحلیل...";
+ fetch(`/analyze?symbol=${encodeURIComponent(s)}`)
+ .then(async r=>{let d=await r.json();if(!r.ok)throw Error(d.detail||"خطا");return d})
+ .then(d=>{
+   let cls=d.signal.includes("BUY")?"good":(d.signal.includes("SELL")?"bad":"warn");
+   o.innerHTML=`
+   <h2 class="${cls}">${d.signal}</h2>
+   <b>${d.symbol}</b> — ${d.company||""}
+   <div class="grid">
+    <div class="box">قیمت<br>${f(d.price)}</div>
+    <div class="box">امتیاز<br>${f(d.score)}</div>
+    <div class="box">RSI<br>${f(d.rsi)}</div>
+    <div class="box">ورود<br>${f(d.entry)}</div>
+    <div class="box">حد ضرر<br>${f(d.stop_loss)}</div>
+    <div class="box">TP1<br>${f(d.take_profit_1)}</div>
+    <div class="box">TP2<br>${f(d.take_profit_2)}</div>
+    <div class="box">TP3<br>${f(d.take_profit_3)}</div>
+    <div class="box">حمایت<br>${f(d.support)}</div>
+    <div class="box">مقاومت<br>${f(d.resistance)}</div>
+    <div class="box">EMA20<br>${f(d.ema20)}</div>
+    <div class="box">EMA50<br>${f(d.ema50)}</div>
+   </div>
+   <p><b>دلایل:</b><br>${d.reasons.join("<br>")}</p>
+   <p class="small">منبع داده: TSETMC — اجرای سفارش در این نسخه به‌صورت مستقیم خودکار نمی‌شود؛ دکمه ایزی‌تریدر برای ورود به سامانه مفید است.</p>`;
+ })
+ .catch(e=>o.innerHTML="❌ خطا: "+e.message);
 }
 
-return Number(value).toLocaleString(
-"en-US",
-{
-maximumFractionDigits:8
+function backtest(){
+ const s=document.getElementById("symbol").value.trim();
+ const o=document.getElementById("result");
+ o.innerHTML="⏳ در حال اجرای بک‌تست...";
+ fetch(`/backtest?symbol=${encodeURIComponent(s)}&lookback=100`)
+ .then(async r=>{let d=await r.json();if(!r.ok)throw Error(d.detail||"خطا");return d})
+ .then(d=>{
+   o.innerHTML=`
+   <h2>🧪 نتیجه بک‌تست ${d.symbol}</h2>
+   <div class="grid">
+    <div class="box">تعداد معاملات<br>${f(d.trades)}</div>
+    <div class="box">برد<br>${f(d.wins)}</div>
+    <div class="box">باخت<br>${f(d.losses)}</div>
+    <div class="box">Win Rate<br>${f(d.win_rate)}٪</div>
+   </div>
+   <p class="small">${d.message}</p>`;
+ })
+ .catch(e=>o.innerHTML="❌ خطا در بک‌تست: "+e.message);
 }
-);
-
-}
-
-
-async function runAnalysis(){
-
-const symbol =
-document
-.getElementById("symbol")
-.value
-.trim()
-.toUpperCase();
-
-const interval =
-document
-.getElementById("interval")
-.value;
-
-const button =
-document.getElementById("btn");
-
-const result =
-document.getElementById("result");
-
-button.disabled = true;
-
-button.textContent =
-"⏳ در حال تحلیل...";
-
-result.innerHTML =
-"در حال دریافت داده‌های بازار...";
-
-
-try{
-
-const url =
-"/analyze?symbol=" +
-encodeURIComponent(symbol) +
-"&interval=" +
-encodeURIComponent(interval);
-
-const response =
-await fetch(url);
-
-let data;
-
-try{
-
-data =
-await response.json();
-
-}
-catch(error){
-
-throw new Error(
-"پاسخ معتبر از سرور دریافت نشد."
-);
-
-}
-
-
-if(!response.ok){
-
-throw new Error(
-data.detail ||
-"خطای نامشخص در سرور"
-);
-
-}
-
-
-result.innerHTML = `
-
-<div class="signal">
-
-${data.signal}
-
-</div>
-
-<div class="signal">
-${data.signal}
-</div>
-
-<div style="
-margin:18px 0;
-padding:18px;
-border-radius:22px;
-background:rgba(20,35,60,.75);
-border:1px solid rgba(255,255,255,.08);
-">
-
-<h2 style="margin-top:0;text-align:center;">
-📊 تحلیل چندتایم‌فریمی
-</h2>
-
-<div class="grid">
-
-<div class="box"><div class="box">
-🎯 ناحیه ورود
-<br>
-<b>
-${data.entry_low != null && data.entry_high != null
-    ? formatNumber(data.entry_low) + " — " + formatNumber(data.entry_high)
-    : "-"}
-</b>
-</div>
-1 ساعت
-<br><br>
-<b>${data.mtf?.["1h"]?.signal || "-"}</b>
-<br>
-${data.mtf?.["1h"]?.confidence ?? "-"}%
-</div>
-
-<div class="box">
-4 ساعت
-<br><br>
-<b>${data.mtf?.["4h"]?.signal || "-"}</b>
-<br>
-${data.mtf?.["4h"]?.confidence ?? "-"}%
-</div>
-
-<div class="box">
-1 روز
-<br><br>
-<b>${data.mtf?.["1d"]?.signal || "-"}</b>
-<br>
-${data.mtf?.["1d"]?.confidence ?? "-"}%
-</div>
-
-</div>
-
-</div>
-
-<div class="grid">
-<div class="grid">
-
-<div class="box">
-
-قیمت
-
-<br>
-
-<b>
-${formatNumber(data.price)}
-</b>
-
-</div>
-
-
-<div class="box">
-
-RSI
-
-<br>
-
-<b>
-${formatNumber(data.rsi)}
-</b>
-
-</div>
-
-<div class="box">
-
-اعتماد تحلیل
-
-<br>
-
-<b>
-${formatNumber(data.confidence)}%
-</b>
-
-</div>
-
-<div class="box">
-
-قدرت روند
-
-<br>
-
-<b>
-${formatNumber(data.trend_strength)}
-</b>
-
-</div>
-
-<div class="box">
-
-R/R - TP1
-
-<br>
-
-<b>
-${formatNumber(data.rr1)}
-</b>
-
-</div>
-
-<div class="box">
-
-R/R - TP2
-
-<br>
-
-<b>
-${formatNumber(data.rr2)}
-</b>
-
-</div>
-
-<div class="box">
-
-R/R - TP3
-
-<br>
-
-<b>
-${formatNumber(data.rr3)}
-</b>
-
-</div>
-<div class="box">
-
-ورود
-
-<br>
-
-<b>
-${formatNumber(data.entry)}
-</b>
-
-</div>
-
-
-<div class="box">
-
-حد ضرر
-
-<br>
-
-<b>
-${formatNumber(data.stop_loss)}
-</b>
-
-</div>
-
-
-<div class="box">
-
-TP1
-
-<br>
-
-<b>
-${formatNumber(data.take_profit_1)}
-</b>
-
-</div>
-
-
-<div class="box">
-
-TP2
-
-<br>
-
-<b>
-${formatNumber(data.take_profit_2)}
-</b>
-
-</div>
-
-
-<div class="box">
-
-TP3
-
-<br>
-
-<b>
-${formatNumber(data.take_profit_3)}
-</b>
-
-</div>
-
-
-<div class="box">
-
-امتیاز
-
-<br>
-
-<b>
-${data.score}
-</b>
-
-</div>
-
-<div class="box">
-
-اعتماد سیگنال
-
-<br>
-
-<b>
-${formatNumber(data.confidence)}%
-</b>
-
-</div>
-
-<div class="box">
-<div class="box">
-
-R/R - TP1
-
-<br>
-
-<b>
-${formatNumber(data.rr1)}
-</b>
-
-</div>
-
-<div class="box">
-
-R/R - TP2
-
-<br>
-
-<b>
-${formatNumber(data.rr2)}
-</b>
-
-</div>
-
-<div class="box">
-
-R/R - TP3
-
-<br>
-
-<b>
-${formatNumber(data.rr3)}
-</b>
-
-</div>
-<div class="box">
-
-حمایت
-
-<br>
-
-<b>
-${formatNumber(data.support)}
-</b>
-
-</div>
-
-
-<div class="box">
-
-مقاومت
-
-<br>
-
-<b>
-${formatNumber(data.resistance)}
-</b>
-
-</div>
-
-</div>
-
-
-<br>
-
-
-<b>
-دلایل تحلیل:
-</b>
-
-<br>
-
-${data.reasons.join("<br>")}
-
-
-<div class="info">
-
-منبع داده:
-Kraken
-
-<br>
-
-جفت:
-${data.pair}
-
-<br><br>
-
-این خروجی تحلیل تکنیکال است و
-تضمین سود یا توصیه قطعی معامله نیست.
-
-</div>
-
-`;
-
-}
-
-catch(error){
-
-result.innerHTML =
-"❌ خطا: " +
-error.message;
-
-}
-
-finally{
-
-button.disabled = false;
-
-button.textContent =
-"🔍 تحلیل بازار";
-
-}
-
-}
-
 </script>
-
 </body>
-
 </html>
 """
 
 
-# =========================================================
-# HOME
-# =========================================================
-
-@app.get(
-    "/",
-    response_class=HTMLResponse
-)
+@app.get("/", response_class=HTMLResponse)
 def home():
-
     return HTML
