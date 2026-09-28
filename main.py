@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_VERSION = "5.1.0"
+APP_VERSION = "5.2.0"
 TINDEX_BASE = "https://tindex.app"
 TINDEX_TOKEN = os.getenv("TINDEX_API_TOKEN", "").strip()
 EASYTRADER_URL = "https://easytrader.emofid.com"
@@ -341,18 +341,25 @@ def build_signal(df):
     }
 
 
-def run_backtest(df, threshold=3):
-    x = df.copy()
-    x["ema20"] = ema(x["close"], 20)
-    x["ema50"] = ema(x["close"], 50)
-    x["ema200"] = ema(x["close"], 200)
+def run_backtest(df, threshold=2):
+    """Adaptive backtest that works with Tindex's public 2-page history.
+    With long history it uses EMA20/50/200; with the public ~40-row window
+    it switches to EMA10/20 so the button produces a meaningful test instead
+    of always returning zero due to the EMA200 warm-up requirement.
+    """
+    x = df.copy().sort_values("date").reset_index(drop=True)
+    x["ema10"] = x["close"].ewm(span=10, adjust=False).mean()
+    x["ema20"] = x["close"].ewm(span=20, adjust=False).mean()
+    x["ema50"] = x["close"].ewm(span=50, adjust=False).mean()
+    x["ema200"] = x["close"].ewm(span=200, adjust=False).mean()
     x["rsi"] = rsi(x["close"], 14)
     x["macd"], x["macd_signal"], _ = macd(x["close"])
 
-    signals = []
-    # EMA200 به حداقل 200 مشاهده نیاز دارد. اگر داده کمتر بود،
-    # از بیشترین پنجره ممکن استفاده می‌کنیم تا بک‌تست بی‌دلیل صفر نشود.
-    start_index = 200 if len(x) >= 206 else max(50, len(x) // 2)
+    # Public Tindex history currently exposes about 40 rows without sign-in.
+    # Use the longer EMA model when enough history exists; otherwise use the
+    # shorter model so the backtest can actually run on the available window.
+    short_mode = len(x) < 206
+    start_index = 20 if short_mode else 200
     if len(x) <= start_index + 5:
         return {
             "trades": 0,
@@ -362,12 +369,19 @@ def run_backtest(df, threshold=3):
             "note": f"داده کافی برای بک‌تست وجود ندارد؛ {len(x)} رکورد دریافت شد."
         }
 
+    signals = []
     for i in range(start_index, len(x) - 5):
         row = x.iloc[i]
         score = 0
-        score += 1 if row["close"] > row["ema20"] else -1
-        score += 1 if row["close"] > row["ema50"] else -1
-        score += 1 if row["close"] > row["ema200"] else -1
+
+        if short_mode:
+            score += 1 if row["close"] > row["ema10"] else -1
+            score += 1 if row["ema10"] > row["ema20"] else -1
+        else:
+            score += 1 if row["close"] > row["ema20"] else -1
+            score += 1 if row["close"] > row["ema50"] else -1
+            score += 1 if row["close"] > row["ema200"] else -1
+
         score += 1 if row["rsi"] >= 55 else (-1 if row["rsi"] <= 45 else 0)
         score += 1 if row["macd"] > row["macd_signal"] else -1
 
@@ -395,22 +409,25 @@ def run_backtest(df, threshold=3):
             "win_rate_pct": 0,
             "avg_return_pct": 0,
             "total_return_pct": 0,
-            "note": "در داده موجود معامله‌ای با این شروط ایجاد نشد.",
+            "note": "در پنجره تاریخی موجود سیگنال کافی با این شروط ایجاد نشد."
         }
 
     bt = pd.DataFrame(signals)
     wins = (bt["return_pct"] > 0).sum()
     avg = bt["return_pct"].mean()
-
-    # بازده مرکب ساده برای معاملات پشت سر هم
     total = ((1 + bt["return_pct"] / 100).prod() - 1) * 100
+    mode_note = (
+        "به‌دلیل محدودیت تاریخچه عمومی Tindex، این بک‌تست با EMA10/20 انجام شد."
+        if short_mode else
+        "این بک‌تست با EMA20/50/200 انجام شد."
+    )
 
     return {
         "trades": int(len(bt)),
         "win_rate_pct": round(float(wins / len(bt) * 100), 2),
         "avg_return_pct": round(float(avg), 2),
         "total_return_pct": round(float(total), 2),
-        "note": "بک‌تست ساده 5 روزه است؛ کارمزد، صف خرید/فروش و لغزش قیمت لحاظ نشده است.",
+        "note": mode_note + " افق هر معامله 5 روز است؛ کارمزد، صف خرید/فروش و لغزش قیمت لحاظ نشده است."
     }
 
 
@@ -446,7 +463,7 @@ a{color:#2563eb}
 <body>
 <div class="wrap">
 <div class="card">
-<h1>📊 تحلیل‌گر بورس ایران — نسخه 5</h1>
+<h1>📊 تحلیل‌گر بورس ایران — نسخه 5.2</h1>
 <div class="small">منبع داده قیمت: صفحه عمومی تاریخچه سهام Tindex. برای هر تحلیل چند صفحه از تاریخچه دریافت می‌شود و در سرور ۵ دقیقه کش می‌شود.</div>
 <input id="symbol" value="استیل" placeholder="نماد، مثال: استیل">
 <button onclick="analyze()">تحلیل نماد</button>
@@ -547,7 +564,7 @@ def backtest(symbol: str = Query(..., min_length=1, max_length=50)):
     try:
         # بک‌تست برای EMA200 حداقل به بیش از 205 روز داده نیاز دارد.
         # 20 صفحه تقریباً 400 روز معاملاتی در اختیار موتور می‌گذارد.
-        df = get_history(symbol, pages=20)
+        df = get_history(symbol, pages=2)
         return run_backtest(df)
     except Exception as exc:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
