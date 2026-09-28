@@ -1,715 +1,414 @@
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
 import os
-import math
-from datetime import datetime, timedelta, timezone
+import re
+import time
 from urllib.parse import quote
 
-import requests
+import numpy as np
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse, JSONResponse
 
-# ============================================================
-# تحلیل‌گر بورس ایران - نسخه جدید
-# منبع داده: Tindex API
-# سفارش‌گذاری: فقط از طریق لینک EasyTrader
-# ============================================================
-
-app = FastAPI(
-    title="تحلیل‌گر بورس ایران",
-    version="4.0.0"
-)
-
-TINDEX_BASE = "https://tindex.app/api/public"
+APP_VERSION = "5.0.0"
+TINDEX_BASE = "https://tindex.app"
 TINDEX_TOKEN = os.getenv("TINDEX_API_TOKEN", "").strip()
 EASYTRADER_URL = "https://easytrader.emofid.com"
 
-session = requests.Session()
-session.headers.update({
+app = FastAPI(title="تحلیل‌گر بورس ایران", version=APP_VERSION)
+
+SESSION = requests.Session()
+SESSION.headers.update({
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/140.0 Mobile Safari/537.36"
     ),
-    "Accept": "application/json",
-    "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 })
 
+# حافظه موقت برای کم کردن تعداد درخواست‌ها به Tindex
+CACHE = {}
+CACHE_TTL = 300  # 5 دقیقه
 
-def fa_to_en(value):
+
+def fa_to_en_digits(value):
     if value is None:
         return ""
-    return str(value).translate(str.maketrans(
+    s = str(value)
+    table = str.maketrans(
         "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
-        "01234567890123456789"
-    ))
-
-
-def num(value):
-    try:
-        value = fa_to_en(value)
-        return float(value)
-    except Exception:
-        return None
-
-
-def round_num(value, digits=2):
-    try:
-        if value is None or not math.isfinite(float(value)):
-            return None
-        return round(float(value), digits)
-    except Exception:
-        return None
-
-
-def tindex_get(path, params=None, timeout=15):
-    if not TINDEX_TOKEN:
-        raise HTTPException(
-            500,
-            "متغیر محیطی TINDEX_API_TOKEN در Render تنظیم نشده است."
-        )
-
-    url = f"{TINDEX_BASE}{path}"
-
-    try:
-        r = session.get(
-            url,
-            params=params or {},
-            timeout=(5, timeout),
-            allow_redirects=True
-        )
-    except requests.RequestException as e:
-        raise HTTPException(
-            502,
-            f"ارتباط با Tindex برقرار نشد: {e}"
-        )
-
-    if r.status_code == 401:
-        raise HTTPException(502, "توکن Tindex نامعتبر یا فاقد دسترسی API است.")
-    if r.status_code == 403:
-        raise HTTPException(502, "دسترسی API Tindex برای این درخواست مجاز نیست.")
-    if r.status_code == 429:
-        retry = r.headers.get("Retry-After", "")
-        raise HTTPException(
-            429,
-            f"سقف درخواست Tindex پر شده است. "
-            f"لطفاً کمی بعد دوباره تلاش کنید. {retry}"
-        )
-
-    try:
-        payload = r.json()
-    except ValueError:
-        raise HTTPException(502, "پاسخ نامعتبر از Tindex دریافت شد.")
-
-    if r.status_code >= 400:
-        raise HTTPException(
-            502,
-            payload.get("message", "خطا از سرویس Tindex")
-            if isinstance(payload, dict) else "خطا از سرویس Tindex"
-        )
-
-    if isinstance(payload, dict) and payload.get("success") is False:
-        raise HTTPException(
-            502,
-            payload.get("message", "Tindex درخواست را رد کرد.")
-        )
-
-    return payload
-
-
-def _rows_from_stock_response(payload):
-    """
-    Tindex stock screener پاسخ را به شکل data/rows یا data/list برمی‌گرداند.
-    این تابع چند شکل متداول را پشتیبانی می‌کند.
-    """
-    data = payload.get("data") if isinstance(payload, dict) else None
-
-    if isinstance(data, dict):
-        rows = data.get("rows")
-        if isinstance(rows, list):
-            return rows
-
-        items = data.get("items")
-        if isinstance(items, list):
-            return items
-
-    if isinstance(data, list):
-        return data
-
-    if isinstance(payload, dict):
-        for key in ("rows", "items", "stocks"):
-            if isinstance(payload.get(key), list):
-                return payload[key]
-
-    return []
-
-
-def search_stock(symbol):
-    symbol = str(symbol).strip()
-    if not symbol:
-        raise HTTPException(400, "نماد را وارد کنید.")
-
-    # Tindex تمام نمادهای بورس تهران را زیر stock-energy قرار داده است.
-    payload = tindex_get(
-        "/stocks/by-category/stock-energy",
-        params={
-            "search": symbol,
-            "page": 1,
-            "per_page": 50,
-            "lang": "fa",
-        },
-        timeout=20,
+        "01234567890123456789",
     )
-
-    rows = _rows_from_stock_response(payload)
-
-    if not rows:
-        raise HTTPException(
-            404,
-            f"نماد «{symbol}» در Tindex پیدا نشد."
-        )
-
-    def text(x, *keys):
-        for key in keys:
-            value = x.get(key)
-            if value not in (None, ""):
-                return str(value).strip()
-        return ""
-
-    normalized = []
-
-    for x in rows:
-        ticker = text(x, "ticker", "symbol", "code", "name_fa")
-        name = text(x, "name", "company", "company_name", "title")
-        slug = text(x, "slug", "ticker_slug")
-
-        normalized.append({
-            "slug": slug,
-            "ticker": ticker,
-            "name": name,
-            "company": name,
-            "price": num(x.get("price") or x.get("last_price")),
-            "change": num(x.get("change") or x.get("change_percent")),
-            "volume": num(x.get("volume")),
-            "value": num(x.get("turnover") or x.get("trade_value")),
-            "raw": x,
-        })
-
-    wanted = symbol.strip()
-
-    exact = [
-        x for x in normalized
-        if x["ticker"].strip() == wanted
-    ]
-
-    if exact:
-        return exact[0], normalized
-
-    exact_slug_name = [
-        x for x in normalized
-        if wanted in (x["name"] or "")
-    ]
-
-    if exact_slug_name:
-        return exact_slug_name[0], normalized
-
-    # اگر API فیلتر جستجو را نادیده گرفته باشد، فقط وقتی یک نتیجه داریم
-    # همان نتیجه را قبول می‌کنیم.
-    if len(normalized) == 1:
-        return normalized[0], normalized
-
-    raise HTTPException(
-        404,
-        f"نماد «{symbol}» دقیقاً در نتایج Tindex پیدا نشد."
-    )
+    return s.translate(table)
 
 
-def decode_tindex_days(t_values):
-    """
-    طبق مستندات Tindex:
-    عنصر اول t مطلق است و از عنصر دوم به بعد مقدارها delta هستند.
-    """
-    if not t_values:
+def clean_number(value):
+    s = fa_to_en_digits(value)
+    s = s.replace(",", "").replace("٬", "").replace(" ", "").strip()
+    s = re.sub(r"[^\d.\-]", "", s)
+    if not s or s in {"-", "."}:
+        return np.nan
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
+
+
+def normalize_header(text):
+    s = fa_to_en_digits(text).strip().lower()
+    s = s.replace(" ", "").replace("_", "")
+    return s
+
+
+def fetch_history_page(symbol, page=1):
+    encoded = quote(symbol.strip(), safe="")
+    url = f"{TINDEX_BASE}/en/stocks/{encoded}/history/"
+    if page > 1:
+        url += f"?page={page}"
+
+    try:
+        r = SESSION.get(url, timeout=20)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"ارتباط با Tindex برقرار نشد: {exc}") from exc
+
+    if r.status_code == 404:
+        raise RuntimeError(f"نماد «{symbol}» در Tindex پیدا نشد.")
+    if r.status_code != 200:
+        raise RuntimeError(f"Tindex با کد {r.status_code} پاسخ داد.")
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # جدول تاریخچه را با نام ستون‌ها پیدا می‌کنیم.
+    wanted = {"date", "open", "high", "low", "close"}
+    target = None
+
+    for table in soup.find_all("table"):
+        headers = []
+        first_row = table.find("tr")
+        if first_row:
+            headers = [normalize_header(x.get_text(" ", strip=True))
+                       for x in first_row.find_all(["th", "td"])]
+        if wanted.issubset(set(headers)):
+            target = table
+            break
+
+    if target is None:
+        # گاهی ساختار صفحه تغییر می‌کند؛ متن خطای قابل فهم برمی‌گردانیم.
+        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        if "stock" not in title.lower() and "history" not in title.lower():
+            raise RuntimeError(
+                f"صفحه تاریخچه نماد «{symbol}» قابل خواندن نیست؛ "
+                "ممکن است ساختار Tindex تغییر کرده باشد."
+            )
         return []
 
-    out = []
-    current = None
-
-    for i, raw in enumerate(t_values):
-        try:
-            value = int(raw)
-        except Exception:
-            out.append(None)
+    rows = []
+    tr_list = target.find_all("tr")
+    for tr in tr_list[1:]:
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+        if len(cells) < 5:
             continue
 
-        if i == 0:
-            current = value
-        else:
-            current = current + value
+        # ستون‌ها بر اساس هدر جدول، نه جای ثابت، خوانده می‌شوند.
+        header_cells = [
+            normalize_header(x.get_text(" ", strip=True))
+            for x in tr_list[0].find_all(["th", "td"])
+        ]
+        row_map = dict(zip(header_cells, cells))
 
-        out.append(current)
+        date_text = row_map.get("date", "")
+        op = clean_number(row_map.get("open"))
+        hi = clean_number(row_map.get("high"))
+        lo = clean_number(row_map.get("low"))
+        cl = clean_number(row_map.get("close"))
 
-    return out
-
-
-def history_from_tindex(slug):
-    if not slug:
-        raise HTTPException(404, "شناسه Tindex نماد پیدا نشد.")
-
-    # سه ماه حدود 90 روز داده می‌دهد و برای تحلیل فعلی کافی است.
-    payload = tindex_get(
-        f"/indicators/{quote(slug, safe='')}/candles",
-        params={
-            "range": "3m",
-            "interval": "daily",
-            "lang": "fa",
-        },
-        timeout=20,
-    )
-
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, dict):
-        raise HTTPException(502, "ساختار داده شمعی Tindex نامعتبر است.")
-
-    t = decode_tindex_days(data.get("t", []))
-    opens = data.get("o", [])
-    highs = data.get("h", [])
-    lows = data.get("l", [])
-    closes = data.get("c", [])
-
-    n = min(len(t), len(opens), len(highs), len(lows), len(closes))
-
-    if n < 60:
-        raise HTTPException(
-            400,
-            f"داده کافی برای تحلیل وجود ندارد؛ فقط {n} روز داده دریافت شد."
-        )
-
-    records = []
-
-    for i in range(n):
-        if t[i] is None:
+        if not date_text or pd.isna(cl):
             continue
 
         try:
-            date_value = (
-                datetime(1970, 1, 1, tzinfo=timezone.utc)
-                + timedelta(days=int(t[i]))
-            ).date().isoformat()
+            dt = pd.to_datetime(date_text, dayfirst=False, errors="coerce")
         except Exception:
+            dt = pd.NaT
+
+        if pd.isna(dt):
             continue
 
-        o = num(opens[i])
-        h = num(highs[i])
-        l = num(lows[i])
-        c = num(closes[i])
-
-        if c is None:
-            continue
-
-        records.append({
-            "date": date_value,
-            "open": o if o is not None else c,
-            "high": h if h is not None else c,
-            "low": l if l is not None else c,
-            "close": c,
-            "last": c,
-            "volume": 0,
-            "value": 0,
+        rows.append({
+            "date": dt,
+            "open": op,
+            "high": hi,
+            "low": lo,
+            "close": cl,
         })
 
-    df = pd.DataFrame(records)
+    return rows
 
-    if df.empty:
-        raise HTTPException(400, "تاریخچه قابل استفاده دریافت نشد.")
 
-    for col in ["open", "high", "low", "close", "last", "volume", "value"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+def get_history(symbol, pages=10):
+    key = symbol.strip()
+    now = time.time()
 
-    df["open"] = df["open"].fillna(df["close"])
-    df["high"] = df["high"].fillna(df["close"])
-    df["low"] = df["low"].fillna(df["close"])
+    cached = CACHE.get(key)
+    if cached and now - cached["time"] < CACHE_TTL:
+        return cached["df"].copy()
 
-    df = (
-        df.dropna(subset=["close"])
-          .drop_duplicates(subset=["date"], keep="last")
-          .sort_values("date")
-          .reset_index(drop=True)
-    )
+    all_rows = []
+    seen_dates = set()
 
-    if len(df) < 60:
-        raise HTTPException(
-            400,
-            f"برای تحلیل تکنیکال حداقل 60 روز داده لازم است؛ "
-            f"دریافتی: {len(df)} روز."
+    for page in range(1, pages + 1):
+        rows = fetch_history_page(key, page)
+        if not rows:
+            break
+
+        new_count = 0
+        for row in rows:
+            d = row["date"]
+            if d not in seen_dates:
+                seen_dates.add(d)
+                all_rows.append(row)
+                new_count += 1
+
+        if new_count == 0:
+            break
+
+    if len(all_rows) < 20:
+        raise RuntimeError(
+            f"برای «{symbol}» داده تاریخی کافی دریافت نشد. "
+            f"تعداد رکورد دریافت‌شده: {len(all_rows)}"
         )
 
+    df = pd.DataFrame(all_rows)
+    df = df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["close"]).reset_index(drop=True)
+
+    CACHE[key] = {"time": now, "df": df.copy()}
     return df
 
 
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
 
 
-def rsi(series, period=14):
-    delta = series.diff()
+def rsi(s, n=14):
+    delta = s.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-    result = 100 - (100 / (1 + rs))
-
-    return result.fillna(50)
+    avg_gain = gain.ewm(alpha=1 / n, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / n, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50)
 
 
-def atr(df, period=14):
-    previous_close = df["close"].shift(1)
-
+def atr(df, n=14):
+    prev_close = df["close"].shift(1)
     tr = pd.concat([
         df["high"] - df["low"],
-        (df["high"] - previous_close).abs(),
-        (df["low"] - previous_close).abs(),
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs(),
     ], axis=1).max(axis=1)
-
-    return tr.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
+    return tr.ewm(alpha=1 / n, adjust=False).mean()
 
 
-def build_indicators(df):
-    d = df.copy()
-
-    d["ema20"] = ema(d["close"], 20)
-    d["ema50"] = ema(d["close"], 50)
-    d["ema200"] = ema(d["close"], 200)
-
-    d["rsi"] = rsi(d["close"])
-
-    d["ema12"] = ema(d["close"], 12)
-    d["ema26"] = ema(d["close"], 26)
-    d["macd"] = d["ema12"] - d["ema26"]
-    d["macd_signal"] = ema(d["macd"], 9)
-    d["macd_hist"] = d["macd"] - d["macd_signal"]
-
-    d["atr"] = atr(d)
-
-    return d.dropna(
-        subset=[
-            "ema20",
-            "ema50",
-            "ema200",
-            "rsi",
-            "macd",
-            "macd_signal",
-            "atr",
-        ]
-    ).reset_index(drop=True)
+def macd(s):
+    fast = ema(s, 12)
+    slow = ema(s, 26)
+    line = fast - slow
+    signal = ema(line, 9)
+    hist = line - signal
+    return line, signal, hist
 
 
-def analyze_stock(df):
-    d = build_indicators(df)
+def support_resistance(df, window=30):
+    recent = df.tail(min(window, len(df)))
+    support = float(recent["low"].min())
+    resistance = float(recent["high"].max())
+    return support, resistance
 
-    if len(d) < 20:
-        raise HTTPException(400, "داده کافی برای تحلیل تکنیکال وجود ندارد.")
 
-    x = d.iloc[-1]
+def build_signal(df):
+    x = df.copy()
+    x["ema20"] = ema(x["close"], 20)
+    x["ema50"] = ema(x["close"], 50)
+    x["ema200"] = ema(x["close"], 200)
+    x["rsi"] = rsi(x["close"], 14)
+    x["atr"] = atr(x, 14)
+    x["macd"], x["macd_signal"], x["macd_hist"] = macd(x["close"])
 
-    price = float(x["close"])
-    atr_value = float(x["atr"])
-    rsi_value = float(x["rsi"])
+    last = x.iloc[-1]
+    price = float(last["close"])
+    atr_v = float(last["atr"]) if pd.notna(last["atr"]) else price * 0.03
+
+    support, resistance = support_resistance(x, 30)
 
     score = 0
     reasons = []
 
-    if price > x["ema20"]:
+    if price > last["ema20"]:
         score += 1
-        reasons.append("قیمت بالای EMA20 است.")
+        reasons.append("قیمت بالاتر از EMA20 است")
     else:
         score -= 1
-        reasons.append("قیمت زیر EMA20 است.")
+        reasons.append("قیمت پایین‌تر از EMA20 است")
 
-    if x["ema20"] > x["ema50"]:
+    if price > last["ema50"]:
         score += 1
-        reasons.append("EMA20 بالای EMA50 است.")
+        reasons.append("قیمت بالاتر از EMA50 است")
     else:
         score -= 1
-        reasons.append("EMA20 زیر EMA50 است.")
+        reasons.append("قیمت پایین‌تر از EMA50 است")
 
-    # اگر کمتر از 200 روز داده داشته باشیم، EMA200 از خود داده موجود ساخته می‌شود.
-    if x["ema50"] > x["ema200"]:
+    if price > last["ema200"]:
         score += 1
-        reasons.append("EMA50 بالای EMA200 است.")
+        reasons.append("قیمت بالاتر از EMA200 است")
     else:
         score -= 1
-        reasons.append("EMA50 زیر EMA200 است.")
+        reasons.append("قیمت پایین‌تر از EMA200 است")
 
-    if 55 <= rsi_value < 70:
+    if last["rsi"] >= 55:
         score += 1
-        reasons.append("RSI در محدوده قدرت خریداران است.")
-    elif rsi_value >= 75:
+        reasons.append("RSI متمایل به قدرت خرید است")
+    elif last["rsi"] <= 45:
         score -= 1
-        reasons.append("RSI بالا و مستعد اصلاح است.")
-    elif rsi_value < 30:
-        score += 1
-        reasons.append("RSI در محدوده اشباع فروش است.")
-    elif rsi_value < 45:
-        score -= 1
-        reasons.append("RSI ضعیف است.")
+        reasons.append("RSI متمایل به ضعف است")
 
-    if x["macd_hist"] > 0:
+    if last["macd"] > last["macd_signal"]:
         score += 1
-        reasons.append("MACD مثبت است.")
+        reasons.append("MACD بالاتر از خط سیگنال است")
     else:
         score -= 1
-        reasons.append("MACD منفی است.")
+        reasons.append("MACD پایین‌تر از خط سیگنال است")
 
-    support = float(d.tail(40)["low"].min())
-    resistance = float(d.tail(40)["high"].max())
-
-    recent_support = float(d.tail(20)["low"].min())
-    recent_resistance = float(d.tail(20)["high"].max())
-
-    # این بخش «پیشنهاد سرمایه‌گذاری قطعی» نیست؛
-    # صرفاً خروجی الگوریتمی برای کمک به بررسی معامله است.
-    if score >= 4:
-        signal = "BUY SETUP"
+    if score >= 3:
+        signal = "خرید / بررسی ورود"
+        side = "LONG"
         entry = price
-
-        stop = min(
-            recent_support * 0.985,
-            price - 1.5 * atr_value
-        )
-
+        stop = max(support, price - 1.8 * atr_v)
         if stop >= entry:
-            stop = entry - 1.5 * atr_value
-
-        risk = max(entry - stop, atr_value * 0.5)
-
-        tp1 = entry + 1.5 * risk
-        tp2 = entry + 2.5 * risk
-        tp3 = entry + 3.5 * risk
-
+            stop = price - 1.8 * atr_v
+        risk = max(entry - stop, atr_v * 0.5)
+        tp1 = entry + 1.0 * risk
+        tp2 = entry + 2.0 * risk
+        tp3 = entry + 3.0 * risk
     elif score <= -3:
-        signal = "EXIT / WEAK SETUP"
+        signal = "فروش / اجتناب از ورود"
+        side = "SHORT"
         entry = price
-
-        stop = max(
-            recent_resistance * 1.015,
-            price + 1.5 * atr_value
-        )
-
+        stop = min(resistance, price + 1.8 * atr_v)
         if stop <= entry:
-            stop = entry + 1.5 * atr_value
-
-        risk = max(stop - entry, atr_value * 0.5)
-
-        tp1 = entry - 1.5 * risk
-        tp2 = entry - 2.5 * risk
-        tp3 = entry - 3.5 * risk
-
+            stop = price + 1.8 * atr_v
+        risk = max(stop - entry, atr_v * 0.5)
+        tp1 = entry - 1.0 * risk
+        tp2 = entry - 2.0 * risk
+        tp3 = entry - 3.0 * risk
     else:
-        signal = "WAIT"
+        signal = "خنثی / صبر"
+        side = "WAIT"
         entry = price
-        stop = None
-        tp1 = None
-        tp2 = None
-        tp3 = None
-        risk = None
-
-    rr = None
-    if risk:
-        rr = abs(tp2 - entry) / risk
+        stop = price - 1.5 * atr_v
+        tp1 = price + 1.0 * atr_v
+        tp2 = price + 2.0 * atr_v
+        tp3 = price + 3.0 * atr_v
 
     return {
         "signal": signal,
-        "price": round_num(price),
-        "entry": round_num(entry),
-        "stop_loss": round_num(stop),
-        "take_profit_1": round_num(tp1),
-        "take_profit_2": round_num(tp2),
-        "take_profit_3": round_num(tp3),
-        "risk_reward_tp2": round_num(rr),
+        "side": side,
         "score": int(score),
-        "rsi": round_num(rsi_value),
-        "ema20": round_num(x["ema20"]),
-        "ema50": round_num(x["ema50"]),
-        "ema200": round_num(x["ema200"]),
-        "macd": round_num(x["macd"], 4),
-        "macd_signal": round_num(x["macd_signal"], 4),
-        "atr": round_num(atr_value),
-        "support": round_num(support),
-        "resistance": round_num(resistance),
-        "recent_support": round_num(recent_support),
-        "recent_resistance": round_num(recent_resistance),
+        "price": round(price, 2),
+        "entry": round(entry, 2),
+        "stop_loss": round(stop, 2),
+        "take_profit_1": round(tp1, 2),
+        "take_profit_2": round(tp2, 2),
+        "take_profit_3": round(tp3, 2),
+        "support": round(support, 2),
+        "resistance": round(resistance, 2),
+        "rsi": round(float(last["rsi"]), 2),
+        "ema20": round(float(last["ema20"]), 2),
+        "ema50": round(float(last["ema50"]), 2),
+        "ema200": round(float(last["ema200"]), 2),
+        "macd": round(float(last["macd"]), 4),
+        "macd_signal": round(float(last["macd_signal"]), 4),
+        "atr": round(float(atr_v), 2),
         "reasons": reasons,
-        "data_days": len(df),
+        "data_points": int(len(x)),
+        "last_date": str(pd.Timestamp(last["date"]).date()),
+        "data_source": "Tindex public stock history (source shown by Tindex: Tsetmc)",
+        "warning": "این خروجی سیگنال تحلیلی است و تضمین سود یا توصیه سرمایه‌گذاری نیست.",
     }
 
 
-def score_at_row(d, i):
-    x = d.iloc[i]
-    score = 0
+def run_backtest(df, threshold=3):
+    x = df.copy()
+    x["ema20"] = ema(x["close"], 20)
+    x["ema50"] = ema(x["close"], 50)
+    x["ema200"] = ema(x["close"], 200)
+    x["rsi"] = rsi(x["close"], 14)
+    x["macd"], x["macd_signal"], _ = macd(x["close"])
 
-    score += 1 if x["close"] > x["ema20"] else -1
-    score += 1 if x["ema20"] > x["ema50"] else -1
-    score += 1 if x["ema50"] > x["ema200"] else -1
+    signals = []
+    for i in range(200, len(x) - 5):
+        row = x.iloc[i]
+        score = 0
+        score += 1 if row["close"] > row["ema20"] else -1
+        score += 1 if row["close"] > row["ema50"] else -1
+        score += 1 if row["close"] > row["ema200"] else -1
+        score += 1 if row["rsi"] >= 55 else (-1 if row["rsi"] <= 45 else 0)
+        score += 1 if row["macd"] > row["macd_signal"] else -1
 
-    if x["rsi"] >= 55:
-        score += 1
-    elif x["rsi"] <= 45:
-        score -= 1
+        entry = float(x.iloc[i + 1]["open"])
+        exit_price = float(x.iloc[i + 5]["close"])
 
-    score += 1 if x["macd_hist"] > 0 else -1
-
-    return score
-
-
-def backtest(df, lookback=60):
-    d = build_indicators(df)
-
-    if len(d) < 40:
-        return {
-            "trades": 0,
-            "wins": 0,
-            "losses": 0,
-            "win_rate": None,
-            "message": "داده کافی برای بک‌تست وجود ندارد."
-        }
-
-    start = max(0, len(d) - lookback)
-
-    wins = 0
-    losses = 0
-    trades = 0
-
-    for i in range(start, len(d) - 5):
-        row = d.iloc[i]
-
-        if score_at_row(d, i) < 4:
+        if score >= threshold:
+            ret = (exit_price / entry - 1) * 100
+            direction = "LONG"
+        elif score <= -threshold:
+            ret = (entry / exit_price - 1) * 100
+            direction = "SHORT"
+        else:
             continue
 
-        entry = float(row["close"])
-        a = float(row["atr"])
+        signals.append({
+            "date": str(pd.Timestamp(x.iloc[i + 1]["date"]).date()),
+            "direction": direction,
+            "return_pct": ret,
+        })
 
-        stop = entry - 1.5 * a
-        target = entry + 3.0 * a
+    if not signals:
+        return {
+            "trades": 0,
+            "win_rate_pct": 0,
+            "avg_return_pct": 0,
+            "total_return_pct": 0,
+            "note": "در داده موجود معامله‌ای با این شروط ایجاد نشد.",
+        }
 
-        trades += 1
-        outcome = None
+    bt = pd.DataFrame(signals)
+    wins = (bt["return_pct"] > 0).sum()
+    avg = bt["return_pct"].mean()
 
-        for j in range(i + 1, min(i + 6, len(d))):
-            future = d.iloc[j]
-
-            if float(future["low"]) <= stop:
-                outcome = "loss"
-                break
-
-            if float(future["high"]) >= target:
-                outcome = "win"
-                break
-
-        if outcome == "win":
-            wins += 1
-        elif outcome == "loss":
-            losses += 1
-
-    decided = wins + losses
-    win_rate = (wins / decided * 100) if decided else None
+    # بازده مرکب ساده برای معاملات پشت سر هم
+    total = ((1 + bt["return_pct"] / 100).prod() - 1) * 100
 
     return {
-        "trades": trades,
-        "wins": wins,
-        "losses": losses,
-        "win_rate": round_num(win_rate),
-        "lookback": lookback,
-        "message": (
-            "بک‌تست الگوریتمی است و کارمزد، صف خرید/فروش، "
-            "لغزش قیمت و محدودیت نقدشوندگی را کامل شبیه‌سازی نمی‌کند."
-        ),
+        "trades": int(len(bt)),
+        "win_rate_pct": round(float(wins / len(bt) * 100), 2),
+        "avg_return_pct": round(float(avg), 2),
+        "total_return_pct": round(float(total), 2),
+        "note": "بک‌تست ساده 5 روزه است؛ کارمزد، صف خرید/فروش و لغزش قیمت لحاظ نشده است.",
     }
 
 
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "version": "4.0.0",
-        "data_source": "Tindex API",
-        "token_configured": bool(TINDEX_TOKEN),
-        "broker_link": EASYTRADER_URL,
-    }
+def money(v):
+    if v is None or pd.isna(v):
+        return "-"
+    return f"{float(v):,.0f}"
 
 
-@app.get("/symbols")
-def symbols(q: str = Query("استیل")):
-    item, results = search_stock(q)
-
-    return {
-        "query": q,
-        "selected": item,
-        "results": results[:20],
-    }
-
-
-@app.get("/analyze")
-def analyze_market(symbol: str = Query("استیل")):
-    item, _ = search_stock(symbol)
-
-    slug = item.get("slug")
-    if not slug:
-        raise HTTPException(
-            502,
-            "Tindex برای این نماد slug برنگرداند."
-        )
-
-    df = history_from_tindex(slug)
-    result = analyze_stock(df)
-
-    return {
-        **result,
-        "symbol": item.get("ticker") or symbol,
-        "company": item.get("company") or item.get("name") or "",
-        "tindex_slug": slug,
-        "data_source": "Tindex",
-        "easytrader_url": EASYTRADER_URL,
-    }
-
-
-@app.get("/backtest")
-def run_backtest(
-    symbol: str = Query("استیل"),
-    lookback: int = Query(60, ge=30, le=90),
-):
-    item, _ = search_stock(symbol)
-
-    slug = item.get("slug")
-    if not slug:
-        raise HTTPException(502, "Tindex slug برای نماد پیدا نشد.")
-
-    df = history_from_tindex(slug)
-    result = backtest(df, lookback)
-
-    return {
-        "symbol": item.get("ticker") or symbol,
-        "tindex_slug": slug,
-        **result,
-    }
-
-
-HTML = """
+HTML = r"""
 <!doctype html>
 <html lang="fa" dir="rtl">
 <head>
@@ -717,168 +416,88 @@ HTML = """
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>تحلیل‌گر بورس ایران</title>
 <style>
-body{
- margin:0;background:#07101f;color:#fff;
- font-family:Tahoma,Arial,sans-serif
-}
-.wrap{max-width:760px;margin:18px auto;padding:10px}
-.card{
- background:#111d32;padding:20px;border-radius:22px;
- box-shadow:0 8px 30px rgba(0,0,0,.25)
-}
-h1{margin-top:0}
-.sub{color:#aebbd0;line-height:1.9}
-input,button{
- width:100%;box-sizing:border-box;padding:14px;
- border-radius:13px;font-size:17px;margin:6px 0
-}
-input{
- background:#091426;color:#fff;border:1px solid #30405a
-}
-button{
- border:0;background:#16a34a;color:#fff;font-weight:bold
-}
-.secondary{background:#334155}
-.result{
- margin-top:16px;background:#050d1b;padding:15px;
- border-radius:16px;line-height:2
-}
-.grid{
- display:grid;grid-template-columns:1fr 1fr;gap:9px
-}
-.box{
- background:#17243a;padding:10px;border-radius:12px
-}
-.good{color:#39d98a}
-.bad{color:#ff7187}
-.warn{color:#ffd166}
-.small{font-size:12px;color:#91a0b7}
-a{display:block;text-decoration:none}
-@media(max-width:600px){
- .card{padding:15px}
- .grid{grid-template-columns:1fr 1fr}
-}
+body{font-family:Tahoma,Arial,sans-serif;background:#f4f6f8;margin:0;color:#18212b}
+.wrap{max-width:900px;margin:auto;padding:18px}
+.card{background:#fff;border-radius:18px;padding:18px;margin:12px 0;box-shadow:0 5px 20px #00000010}
+h1{margin:0 0 8px;font-size:24px}
+input,button{width:100%;box-sizing:border-box;padding:13px;border-radius:12px;border:1px solid #d5dbe0;font-size:16px}
+button{background:#111827;color:white;border:0;margin-top:10px;cursor:pointer}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.item{background:#f8fafc;border-radius:12px;padding:12px}
+.label{font-size:12px;color:#68717b}.value{font-size:18px;font-weight:bold;margin-top:4px}
+.good{color:#087f5b}.bad{color:#c92a2a}.neutral{color:#b26a00}
+.small{font-size:12px;color:#6b7280;line-height:1.8}
+table{width:100%;border-collapse:collapse}td{padding:9px;border-bottom:1px solid #eee}
+a{color:#2563eb}
 </style>
 </head>
 <body>
 <div class="wrap">
 <div class="card">
-<h1>📈 تحلیل‌گر بورس ایران</h1>
-<div class="sub">
-داده Tindex + تحلیل تکنیکال + محدوده ورود + حد ضرر + حد سود + بک‌تست
+<h1>📊 تحلیل‌گر بورس ایران — نسخه 5</h1>
+<div class="small">منبع داده قیمت: صفحه عمومی تاریخچه سهام Tindex. برای هر تحلیل چند صفحه از تاریخچه دریافت می‌شود و در سرور ۵ دقیقه کش می‌شود.</div>
+<input id="symbol" value="استیل" placeholder="نماد، مثال: استیل">
+<button onclick="analyze()">تحلیل نماد</button>
+<button onclick="backtest()">بک‌تست</button>
 </div>
-
-<input id="symbol" value="استیل"
- placeholder="مثلاً استیل، فولاد، شستا">
-
-<button onclick="analyze()">🔍 تحلیل نماد</button>
-<button class="secondary" onclick="backtest()">🧪 بک‌تست</button>
-
-<a href="https://easytrader.emofid.com" target="_blank">
-<button class="secondary">💼 باز کردن ایزی‌تریدر</button>
-</a>
-
-<div id="result" class="result">
-آماده تحلیل...
+<div id="out"></div>
+<div class="card">
+<a href="https://easytrader.emofid.com" target="_blank">ورود به ایزی‌تریدر مفید ↗</a>
 </div>
 </div>
-</div>
-
 <script>
-const f = v => {
- if(v === null || v === undefined) return "—";
- const n = Number(v);
- if(Number.isNaN(n)) return "—";
- return n.toLocaleString("fa-IR",{maximumFractionDigits:2});
-};
-
-function showError(o,e){
- o.innerHTML = "❌ خطا: " + e.message;
-}
-
-function analyze(){
- const s=document.getElementById("symbol").value.trim();
- const o=document.getElementById("result");
-
- if(!s){
-   o.innerHTML="❌ نماد را وارد کنید.";
-   return;
- }
-
- o.innerHTML="⏳ در حال دریافت داده Tindex و تحلیل...";
-
- fetch("/analyze?symbol="+encodeURIComponent(s))
- .then(async r=>{
-   const d=await r.json();
-   if(!r.ok) throw new Error(d.detail || "خطا");
-   return d;
- })
- .then(d=>{
-   const cls =
-     d.signal === "BUY SETUP" ? "good" :
-     d.signal === "EXIT / WEAK SETUP" ? "bad" : "warn";
-
-   o.innerHTML = `
-   <h2 class="${cls}">${d.signal}</h2>
-   <b>${d.symbol}</b> — ${d.company || ""}
-
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+function box(label,value){return `<div class="item"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`}
+async function analyze(){
+ const s=document.getElementById('symbol').value.trim();
+ if(!s)return;
+ document.getElementById('out').innerHTML='<div class="card">⏳ در حال دریافت تاریخچه و محاسبه تحلیل...</div>';
+ try{
+  const r=await fetch('/analyze?symbol='+encodeURIComponent(s));
+  const j=await r.json();
+  if(!r.ok) throw new Error(j.detail||'خطا');
+  const cls=j.side==='LONG'?'good':j.side==='SHORT'?'bad':'neutral';
+  document.getElementById('out').innerHTML=`
+  <div class="card">
+   <h2 class="${cls}">${esc(j.signal)}</h2>
    <div class="grid">
-    <div class="box">قیمت<br>${f(d.price)}</div>
-    <div class="box">امتیاز<br>${f(d.score)}</div>
-    <div class="box">RSI<br>${f(d.rsi)}</div>
-    <div class="box">EMA20<br>${f(d.ema20)}</div>
-    <div class="box">EMA50<br>${f(d.ema50)}</div>
-    <div class="box">EMA200<br>${f(d.ema200)}</div>
-    <div class="box">ورود<br>${f(d.entry)}</div>
-    <div class="box">حد ضرر<br>${f(d.stop_loss)}</div>
-    <div class="box">TP1<br>${f(d.take_profit_1)}</div>
-    <div class="box">TP2<br>${f(d.take_profit_2)}</div>
-    <div class="box">TP3<br>${f(d.take_profit_3)}</div>
-    <div class="box">R/R<br>${f(d.risk_reward_tp2)}</div>
-    <div class="box">حمایت<br>${f(d.support)}</div>
-    <div class="box">مقاومت<br>${f(d.resistance)}</div>
+    ${box('قیمت آخر',j.price)}
+    ${box('امتیاز',j.score)}
+    ${box('ورود',j.entry)}
+    ${box('حد ضرر',j.stop_loss)}
+    ${box('حد سود ۱',j.take_profit_1)}
+    ${box('حد سود ۲',j.take_profit_2)}
+    ${box('حد سود ۳',j.take_profit_3)}
+    ${box('حمایت',j.support)}
+    ${box('مقاومت',j.resistance)}
+    ${box('RSI',j.rsi)}
+    ${box('EMA20',j.ema20)}
+    ${box('EMA50',j.ema50)}
+    ${box('EMA200',j.ema200)}
    </div>
-
-   <p><b>دلایل:</b><br>${d.reasons.join("<br>")}</p>
-
-   <p class="small">
-   ${d.data_days} روز داده برای تحلیل استفاده شد.
-   منبع: Tindex.
-   خروجی الگوریتمی است و تضمین سود نیست.
-   </p>`;
- })
- .catch(e=>showError(o,e));
+  </div>
+  <div class="card"><h3>دلایل تحلیل</h3><ul>${j.reasons.map(x=>'<li>'+esc(x)+'</li>').join('')}</ul></div>
+  <div class="card small">آخرین تاریخ داده: ${esc(j.last_date)} — تعداد رکورد: ${esc(j.data_points)}<br>${esc(j.data_source)}<br>${esc(j.warning)}</div>`;
+ }catch(e){document.getElementById('out').innerHTML='<div class="card bad">خطا: '+esc(e.message)+'</div>'}
 }
-
-function backtest(){
- const s=document.getElementById("symbol").value.trim();
- const o=document.getElementById("result");
-
- if(!s){
-   o.innerHTML="❌ نماد را وارد کنید.";
-   return;
- }
-
- o.innerHTML="⏳ در حال اجرای بک‌تست...";
-
- fetch("/backtest?symbol="+encodeURIComponent(s)+"&lookback=60")
- .then(async r=>{
-   const d=await r.json();
-   if(!r.ok) throw new Error(d.detail || "خطا");
-   return d;
- })
- .then(d=>{
-   o.innerHTML=`
-   <h2>🧪 بک‌تست ${d.symbol}</h2>
-   <div class="grid">
-    <div class="box">معاملات<br>${f(d.trades)}</div>
-    <div class="box">برد<br>${f(d.wins)}</div>
-    <div class="box">باخت<br>${f(d.losses)}</div>
-    <div class="box">Win Rate<br>${f(d.win_rate)}٪</div>
-   </div>
-   <p class="small">${d.message}</p>`;
- })
- .catch(e=>showError(o,e));
+async function backtest(){
+ const s=document.getElementById('symbol').value.trim();
+ if(!s)return;
+ document.getElementById('out').innerHTML='<div class="card">⏳ در حال اجرای بک‌تست...</div>';
+ try{
+  const r=await fetch('/backtest?symbol='+encodeURIComponent(s));
+  const j=await r.json();
+  if(!r.ok) throw new Error(j.detail||'خطا');
+  document.getElementById('out').innerHTML=`
+  <div class="card"><h2>نتیجه بک‌تست ${esc(s)}</h2>
+  <div class="grid">
+   ${box('تعداد معاملات',j.trades)}
+   ${box('درصد برد',j.win_rate_pct+'%')}
+   ${box('میانگین بازده',j.avg_return_pct+'%')}
+   ${box('بازده مرکب',j.total_return_pct+'%')}
+  </div>
+  <p class="small">${esc(j.note)}</p></div>`;
+ }catch(e){document.getElementById('out').innerHTML='<div class="card bad">خطا: '+esc(e.message)+'</div>'}
 }
 </script>
 </body>
@@ -889,3 +508,40 @@ function backtest(){
 @app.get("/", response_class=HTMLResponse)
 def home():
     return HTML
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "data_source": "Tindex public stock history",
+        "token_configured": bool(TINDEX_TOKEN),
+        "broker_link": EASYTRADER_URL,
+    }
+
+
+@app.get("/analyze")
+def analyze(symbol: str = Query(..., min_length=1, max_length=50)):
+    try:
+        df = get_history(symbol, pages=10)
+        return build_signal(df)
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.get("/backtest")
+def backtest(symbol: str = Query(..., min_length=1, max_length=50)):
+    try:
+        df = get_history(symbol, pages=10)
+        return run_backtest(df)
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.get("/symbols")
+def symbols():
+    return {
+        "note": "جستجوی نماد از API حذف‌شده Tindex استفاده نمی‌کند؛ نماد مستقیماً از صفحه عمومی Tindex خوانده می‌شود.",
+        "example": ["استیل", "شستا", "فملی", "خودرو"],
+    }
