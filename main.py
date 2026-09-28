@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_VERSION = "5.6.1"
+APP_VERSION = "5.6.2"
 TINDEX_BASE = "https://tindex.app"
 TINDEX_TOKEN = os.getenv("TINDEX_API_TOKEN", "").strip()
 EASYTRADER_URL = "https://easytrader.emofid.com"
@@ -829,31 +829,36 @@ HTML = r"""
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>تحلیل‌گر بورس ایران</title>
 <style>
-body{font-family:Tahoma,Arial,sans-serif;background:#f4f6f8;margin:0;color:#18212b}
-.wrap{max-width:900px;margin:auto;padding:18px}
-.card{background:#fff;border-radius:18px;padding:18px;margin:12px 0;box-shadow:0 5px 20px #00000010}
-h1{margin:0 0 8px;font-size:24px}
-input,button{width:100%;box-sizing:border-box;padding:13px;border-radius:12px;border:1px solid #d5dbe0;font-size:16px}
-button{background:#111827;color:white;border:0;margin-top:10px;cursor:pointer}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
-.item{background:#f8fafc;border-radius:12px;padding:12px}
-.label{font-size:12px;color:#68717b}.value{font-size:18px;font-weight:bold;margin-top:4px}
-.good{color:#087f5b}.bad{color:#c92a2a}.neutral{color:#b26a00}
-.small{font-size:12px;color:#6b7280;line-height:1.8}
-table{width:100%;border-collapse:collapse}td{padding:9px;border-bottom:1px solid #eee}
-a{color:#2563eb}
+body{font-family:Tahoma,Arial,sans-serif;background:linear-gradient(135deg,#eef4ff,#f8fafc 45%,#eefaf6);margin:0;color:#18212b;min-height:100vh}
+.wrap{max-width:980px;margin:auto;padding:18px}
+.card{background:rgba(255,255,255,.92);backdrop-filter:blur(10px);border:1px solid #ffffff;border-radius:22px;padding:20px;margin:14px 0;box-shadow:0 12px 35px #1f3b5d18}
+h1{margin:0 0 8px;font-size:26px;letter-spacing:-.4px}
+.hero{display:flex;justify-content:space-between;gap:14px;align-items:center;margin-bottom:16px}.badge{background:#e8f7f1;color:#087f5b;border-radius:999px;padding:7px 12px;font-size:12px;font-weight:bold}
+label{display:block;font-size:13px;font-weight:bold;margin:12px 0 7px;color:#475569}
+input,select,button{width:100%;box-sizing:border-box;padding:13px 14px;border-radius:14px;border:1px solid #d8e0e8;font-size:16px;background:#fff;outline:none}input:focus,select:focus{border-color:#6b8cff;box-shadow:0 0 0 3px #6b8cff18}
+.searchRow{display:grid;grid-template-columns:1fr 1.4fr;gap:10px}.searchBox{position:relative}.searchIcon{position:absolute;right:12px;top:12px;font-size:18px;color:#94a3b8}.searchBox input{padding-right:40px}
+button{background:linear-gradient(135deg,#172554,#1e40af);color:white;border:0;margin-top:10px;cursor:pointer;font-weight:bold;box-shadow:0 7px 18px #1e40af25;transition:.15s}button:hover{transform:translateY(-1px)}button.secondary{background:#334155}.buttonGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.item{background:#f8fafc;border:1px solid #edf1f5;border-radius:15px;padding:13px}.label{font-size:12px;color:#68717b}.value{font-size:18px;font-weight:bold;margin-top:4px}
+.good{color:#087f5b}.bad{color:#c92a2a}.neutral{color:#b26a00}.small{font-size:12px;color:#6b7280;line-height:1.8}table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px solid #eee;text-align:right}th{background:#f8fafc}a{color:#2563eb}
+@media(max-width:650px){.wrap{padding:10px}.searchRow,.buttonGrid{grid-template-columns:1fr}.hero{align-items:flex-start}.card{padding:15px}}
 </style>
 </head>
 <body>
 <div class="wrap">
 <div class="card">
-<h1>📊 تحلیل‌گر بورس ایران — نسخه 5.6.1</h1>
+<div class="hero"><div><h1>📊 تحلیل‌گر بورس ایران</h1><div class="small">تحلیل تکنیکال، سیگنال هوشمند، بک‌تست و اسکن بازار</div></div><div class="badge">نسخه 5.6.2</div></div>
 <div class="small">منبع داده قیمت: صفحه عمومی تاریخچه سهام Tindex. برای هر تحلیل چند صفحه از تاریخچه دریافت می‌شود و در سرور ۵ دقیقه کش می‌شود.</div>
-<select id="symbol"><option value="">⏳ در حال دریافت فهرست نمادها...</option></select>
+<label>انتخاب نماد</label>
+<div class="searchRow">
+ <div class="searchBox"><span class="searchIcon">⌕</span><input id="symbolSearch" placeholder="جستجوی نماد..." oninput="filterSymbols()"></div>
+ <select id="symbol"><option value="">⏳ در حال دریافت فهرست نمادها...</option></select>
+</div>
 <div id="symbolCount" class="small">⏳ در حال دریافت فهرست نمادهای بازار...</div>
-<button onclick="analyze()">تحلیل نماد</button>
-<button onclick="backtest()">بک‌تست</button>
+<div class="buttonGrid">
+<button onclick="analyze()">🔍 تحلیل نماد</button>
+<button class="secondary" onclick="backtest()">🧪 بک‌تست</button>
 <button onclick="scanMarket()">🔎 اسکن کل بازار</button>
+</div>
 </div>
 <div id="out"></div>
 <div id="scanOut"></div>
@@ -864,19 +869,35 @@ a{color:#2563eb}
 <script>
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function box(label,value){return `<div class="item"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`}
+let allSymbols=[];
 async function loadSymbols(){
  try{
   const r=await fetch('/symbols');
   const j=await r.json();
   if(!r.ok) throw new Error(j.detail||'خطا در دریافت نمادها');
+  allSymbols=j.symbols||[];
+  renderSymbols(allSymbols);
   const list=document.getElementById('symbol');
-  list.innerHTML=j.symbols.map((x,i)=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');
   if(j.symbols.includes('استیل')) list.value='استیل';
   else if(j.symbols.length) list.value=j.symbols[0];
-  document.getElementById('symbolCount').textContent=`✅ ${j.count} نماد در فهرست بازار موجود است؛ نماد را فقط از لیست انتخاب کن.`;
+  document.getElementById('symbolCount').textContent=`✅ ${Number(j.count||0).toLocaleString('fa-IR')} نماد در فهرست بازار موجود است؛ می‌توانی از لیست انتخاب کنی یا جستجو کنی.`;
  }catch(e){
   document.getElementById('symbolCount').textContent='⚠️ دریافت فهرست نمادها ناموفق بود؛ صفحه را دوباره باز کن.';
  }
+}
+
+
+function renderSymbols(items){
+ const list=document.getElementById('symbol');
+ list.innerHTML=items.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');
+ if(items.includes('استیل')) list.value='استیل';
+ else if(items.length) list.value=items[0];
+}
+function filterSymbols(){
+ const q=document.getElementById('symbolSearch').value.trim().toLowerCase();
+ const filtered=!q?allSymbols:allSymbols.filter(x=>String(x).toLowerCase().includes(q));
+ renderSymbols(filtered);
+ document.getElementById('symbolCount').textContent=`🔎 ${filtered.length.toLocaleString('fa-IR')} نماد مطابق جستجو`;
 }
 
 async function analyze(){
