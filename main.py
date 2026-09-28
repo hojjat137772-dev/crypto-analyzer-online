@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_VERSION = "5.5.1"
+APP_VERSION = "5.6.1"
 TINDEX_BASE = "https://tindex.app"
 TINDEX_TOKEN = os.getenv("TINDEX_API_TOKEN", "").strip()
 EASYTRADER_URL = "https://easytrader.emofid.com"
@@ -150,35 +150,24 @@ def get_all_symbols():
         return list(SYMBOLS_CACHE["rows"])
 
     def parse_screener_page(soup):
+        # Tindex currently exposes the stock table with direct /stocks/<slug>/ links.
+        # Parse links first so minor table markup changes do not empty the list.
         from urllib.parse import unquote
         rows = []
         seen = set()
-        for table in soup.find_all("table"):
-            trs = table.find_all("tr")
-            if not trs:
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            m = re.search(r"/(?:en/)?stocks/([^/?#]+)/?(?:\?|#|$)", href)
+            if not m:
                 continue
-            header = [normalize_header(x.get_text(" ", strip=True))
-                      for x in trs[0].find_all(["th", "td"])]
-            if not any(h == "symbol" or h.startswith("symbol") for h in header):
+            sym = unquote(m.group(1)).strip()
+            if not sym or len(sym) > 40 or sym.lower() in {"history", "monthly", "performance", "fundamentals", "valuation"}:
                 continue
-            for tr in trs[1:]:
-                a = tr.find("a", href=True)
-                if not a:
-                    continue
-                href = a.get("href", "")
-                m = re.search(r"/(?:en/)?stocks/([^/?#]+)/?(?:\?|#|$)", href)
-                if not m:
-                    continue
-                sym = unquote(m.group(1)).strip()
-                if not sym or len(sym) > 40 or sym in seen:
-                    continue
-                # The first cell is the display ticker; keep the visible name too.
-                cells = tr.find_all(["td", "th"])
-                name = cells[0].get_text(" ", strip=True) if cells else a.get_text(" ", strip=True)
-                rows.append({"symbol": sym, "name": name})
-                seen.add(sym)
-            if rows:
-                break
+            if sym in seen:
+                continue
+            text_name = a.get_text(" ", strip=True) or sym
+            rows.append({"symbol": sym, "name": text_name})
+            seen.add(sym)
         return rows
 
     # First page gives us the total number of symbols and the first 20 rows.
@@ -204,23 +193,28 @@ def get_all_symbols():
             seen.add(row["symbol"])
             all_rows.append(row)
 
-    # Fetch remaining HTML pages concurrently. These are public website pages,
-    # not API calls, so this does not consume the user's API quota.
+    # Fetch remaining public HTML pages politely and sequentially.
+    # This avoids hammering Tindex and triggering HTTP 429.
     if last_page > 1:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        def fetch_and_parse(page):
-            try:
-                return parse_screener_page(fetch_stock_list_page(page))
-            except Exception:
-                return []
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            futures = [ex.submit(fetch_and_parse, page) for page in range(2, last_page + 1)]
-            for fut in as_completed(futures):
-                for row in fut.result():
-                    sym = row.get("symbol", "")
-                    if sym and sym not in seen:
-                        seen.add(sym)
-                        all_rows.append(row)
+        for page in range(2, last_page + 1):
+            page_rows = []
+            for attempt in range(4):
+                try:
+                    page_rows = parse_screener_page(fetch_stock_list_page(page))
+                    break
+                except RuntimeError as exc:
+                    if " 429" not in str(exc) and "429" not in str(exc):
+                        break
+                    time.sleep(3 * (attempt + 1))
+                except Exception:
+                    break
+            for row in page_rows:
+                sym = row.get("symbol", "")
+                if sym and sym not in seen:
+                    seen.add(sym)
+                    all_rows.append(row)
+            # Small pause between pages keeps the public page requests gentle.
+            time.sleep(0.25)
 
     all_rows.sort(key=lambda x: x.get("symbol", ""))
     if len(all_rows) < 100 and first:
@@ -853,10 +847,9 @@ a{color:#2563eb}
 <body>
 <div class="wrap">
 <div class="card">
-<h1>📊 تحلیل‌گر بورس ایران — نسخه 5.5</h1>
+<h1>📊 تحلیل‌گر بورس ایران — نسخه 5.6.1</h1>
 <div class="small">منبع داده قیمت: صفحه عمومی تاریخچه سهام Tindex. برای هر تحلیل چند صفحه از تاریخچه دریافت می‌شود و در سرور ۵ دقیقه کش می‌شود.</div>
-<input id="symbol" list="symbolsList" value="استیل" placeholder="جستجوی نماد، مثال: استیل">
-<datalist id="symbolsList"></datalist>
+<select id="symbol"><option value="">⏳ در حال دریافت فهرست نمادها...</option></select>
 <div id="symbolCount" class="small">⏳ در حال دریافت فهرست نمادهای بازار...</div>
 <button onclick="analyze()">تحلیل نماد</button>
 <button onclick="backtest()">بک‌تست</button>
@@ -876,11 +869,13 @@ async function loadSymbols(){
   const r=await fetch('/symbols');
   const j=await r.json();
   if(!r.ok) throw new Error(j.detail||'خطا در دریافت نمادها');
-  const list=document.getElementById('symbolsList');
-  list.innerHTML=j.symbols.map(x=>`<option value="${esc(x)}"></option>`).join('');
-  document.getElementById('symbolCount').textContent=`✅ ${j.count} نماد در فهرست بازار موجود است.`;
+  const list=document.getElementById('symbol');
+  list.innerHTML=j.symbols.map((x,i)=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');
+  if(j.symbols.includes('استیل')) list.value='استیل';
+  else if(j.symbols.length) list.value=j.symbols[0];
+  document.getElementById('symbolCount').textContent=`✅ ${j.count} نماد در فهرست بازار موجود است؛ نماد را فقط از لیست انتخاب کن.`;
  }catch(e){
-  document.getElementById('symbolCount').textContent='⚠️ دریافت فهرست نمادها ناموفق بود؛ می‌توانید نماد را دستی وارد کنید.';
+  document.getElementById('symbolCount').textContent='⚠️ دریافت فهرست نمادها ناموفق بود؛ صفحه را دوباره باز کن.';
  }
 }
 
