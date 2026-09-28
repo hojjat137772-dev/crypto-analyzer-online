@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_VERSION = "5.0.0"
+APP_VERSION = "5.1.0"
 TINDEX_BASE = "https://tindex.app"
 TINDEX_TOKEN = os.getenv("TINDEX_API_TOKEN", "").strip()
 EASYTRADER_URL = "https://easytrader.emofid.com"
@@ -144,7 +144,7 @@ def fetch_history_page(symbol, page=1):
     return rows
 
 
-def get_history(symbol, pages=10):
+def get_history(symbol, pages=25):
     key = symbol.strip()
     now = time.time()
 
@@ -350,7 +350,19 @@ def run_backtest(df, threshold=3):
     x["macd"], x["macd_signal"], _ = macd(x["close"])
 
     signals = []
-    for i in range(200, len(x) - 5):
+    # EMA200 به حداقل 200 مشاهده نیاز دارد. اگر داده کمتر بود،
+    # از بیشترین پنجره ممکن استفاده می‌کنیم تا بک‌تست بی‌دلیل صفر نشود.
+    start_index = 200 if len(x) >= 206 else max(50, len(x) // 2)
+    if len(x) <= start_index + 5:
+        return {
+            "trades": 0,
+            "win_rate_pct": 0,
+            "avg_return_pct": 0,
+            "total_return_pct": 0,
+            "note": f"داده کافی برای بک‌تست وجود ندارد؛ {len(x)} رکورد دریافت شد."
+        }
+
+    for i in range(start_index, len(x) - 5):
         row = x.iloc[i]
         score = 0
         score += 1 if row["close"] > row["ema20"] else -1
@@ -524,7 +536,7 @@ def health():
 @app.get("/analyze")
 def analyze(symbol: str = Query(..., min_length=1, max_length=50)):
     try:
-        df = get_history(symbol, pages=10)
+        df = get_history(symbol, pages=25)
         return build_signal(df)
     except Exception as exc:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
