@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_VERSION = "5.5.0"
+APP_VERSION = "5.5.1"
 TINDEX_BASE = "https://tindex.app"
 TINDEX_TOKEN = os.getenv("TINDEX_API_TOKEN", "").strip()
 EASYTRADER_URL = "https://easytrader.emofid.com"
@@ -79,73 +79,105 @@ def fetch_stock_list_page(page=1):
 
 
 def parse_stock_list(soup):
-    target = None
-    for table in soup.find_all("table"):
-        header = [normalize_header(x.get_text(" ", strip=True))
-                  for x in table.find_all("tr")[0].find_all(["th", "td"])] if table.find_all("tr") else []
-        if any("symbol" == h or h.startswith("symbol") for h in header):
-            target = table
-            break
-    if target is None:
-        return []
+    """Extract stock symbols robustly from Tindex screener HTML.
+
+    Tindex may change the table markup. The stock detail links are more
+    stable than the visible table columns, so use them first and fall back
+    to table rows.
+    """
+    from urllib.parse import unquote
 
     rows = []
-    for tr in target.find_all("tr")[1:]:
-        links = tr.find_all("a", href=True)
-        symbol = None
-        for a in links:
-            href = a.get("href", "")
-            m = re.search(r"/stocks/([^/?#]+)/?(?:\?|#|$)", href)
-            if m and "/history" not in href:
-                from urllib.parse import unquote
-                symbol = unquote(m.group(1)).strip()
-                break
-        if not symbol:
-            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-            if cells:
-                symbol = cells[0].split()[0].strip()
-        if symbol and symbol not in {x["symbol"] for x in rows}:
-            rows.append({"symbol": symbol})
-    return rows
+    seen = set()
 
+    # Primary method: collect stock-detail links from the screener page.
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        m = re.search(r"/(?:en/)?stocks/([^/?#]+)/?(?:\?|#|$)", href)
+        if not m:
+            continue
+        slug = unquote(m.group(1)).strip()
+        if not slug or slug.lower() in {"history", "monthly", "performance", "fundamentals", "valuation"}:
+            continue
+        # Avoid option/contract links and keep only plausible Persian/Latin symbols.
+        if len(slug) > 30 or "/" in slug:
+            continue
+        if slug not in seen:
+            seen.add(slug)
+            rows.append({"symbol": slug})
+
+    if rows:
+        return rows
+
+    # Fallback: parse the first table whose header contains Symbol.
+    for table in soup.find_all("table"):
+        trs = table.find_all("tr")
+        if not trs:
+            continue
+        header = [normalize_header(x.get_text(" ", strip=True))
+                  for x in trs[0].find_all(["th", "td"])]
+        if not any(h == "symbol" or h.startswith("symbol") for h in header):
+            continue
+        for tr in trs[1:]:
+            links = tr.find_all("a", href=True)
+            symbol = None
+            for a in links:
+                href = a.get("href", "")
+                m = re.search(r"/(?:en/)?stocks/([^/?#]+)/?(?:\?|#|$)", href)
+                if m:
+                    symbol = unquote(m.group(1)).strip()
+                    break
+            if not symbol:
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+                if cells:
+                    symbol = cells[0].split()[0].strip()
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                rows.append({"symbol": symbol})
+        if rows:
+            break
+    return rows
 
 def get_all_symbols():
     now = time.time()
     if SYMBOLS_CACHE["rows"] and now - SYMBOLS_CACHE["time"] < SYMBOLS_CACHE_TTL:
         return list(SYMBOLS_CACHE["rows"])
 
-    first = fetch_stock_list_page(1)
-    all_rows = parse_stock_list(first)
-    seen = {x["symbol"] for x in all_rows}
+    # Tindex currently shows roughly 1,400 symbols and uses about 20 rows/page.
+    # Do not depend on a particular pagination-link markup; walk a bounded
+    # range and stop after repeated/empty pages.
+    all_rows = []
+    seen = set()
+    empty_pages = 0
 
-    # Tindex pagination links tell us how many pages exist. We use those links
-    # rather than guessing the page size, so changes to the screener remain safe.
-    max_page = 1
-    for a in first.find_all("a", href=True):
-        m = re.search(r"[?&]page=(\d+)", a.get("href", ""))
-        if m:
-            max_page = max(max_page, int(m.group(1)))
-
-    # Safety cap: the current screener is around 1,400 symbols.
-    max_page = min(max_page, 100)
-    for page in range(2, max_page + 1):
+    for page in range(1, 81):
         soup = fetch_stock_list_page(page)
         page_rows = parse_stock_list(soup)
         if not page_rows:
-            break
+            empty_pages += 1
+            if page > 1:
+                break
+            continue
+
         added = 0
         for row in page_rows:
-            if row["symbol"] not in seen:
-                seen.add(row["symbol"])
+            sym = row["symbol"]
+            if sym not in seen:
+                seen.add(sym)
                 all_rows.append(row)
                 added += 1
+
         if added == 0:
-            break
+            empty_pages += 1
+            if empty_pages >= 2:
+                break
+        else:
+            empty_pages = 0
 
     all_rows.sort(key=lambda x: x["symbol"])
-    SYMBOLS_CACHE.update({"time": now, "rows": all_rows})
+    SYMBOLS_CACHE["rows"] = all_rows
+    SYMBOLS_CACHE["time"] = now
     return list(all_rows)
-
 
 def fetch_history_page(symbol, page=1):
     encoded = quote(symbol.strip(), safe="")
@@ -650,7 +682,7 @@ def scan_one_symbol(symbol, min_score=60):
     try:
         # برای اسکن سریع بازار، از اولین صفحه تاریخچه استفاده می‌کنیم.
         # بعد از پیدا شدن نمادهای واجد شرایط، جزئیات کامل در جدول نمایش داده می‌شود.
-        df = get_history(symbol, pages=1)
+        df = get_history(symbol, pages=2)
         signal = build_signal(df)
         if signal["side"] == "LONG" and signal["score"] >= min_score:
             return {
