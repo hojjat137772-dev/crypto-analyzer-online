@@ -1,6 +1,8 @@
 import os
 import re
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 
 import numpy as np
@@ -10,7 +12,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_VERSION = "5.4.0"
+APP_VERSION = "5.5.0"
 TINDEX_BASE = "https://tindex.app"
 TINDEX_TOKEN = os.getenv("TINDEX_API_TOKEN", "").strip()
 EASYTRADER_URL = "https://easytrader.emofid.com"
@@ -629,6 +631,112 @@ def run_backtest(df, threshold=2):
     }
 
 
+# وضعیت اسکن بازار در پس‌زمینه
+SCAN_STATUS = {
+    "running": False,
+    "started_at": 0,
+    "finished_at": 0,
+    "processed": 0,
+    "total": 0,
+    "matches": 0,
+    "results": [],
+    "errors": 0,
+    "message": "هنوز اسکن اجرا نشده است.",
+}
+SCAN_LOCK = threading.Lock()
+
+
+def scan_one_symbol(symbol, min_score=60):
+    try:
+        # برای اسکن سریع بازار، از اولین صفحه تاریخچه استفاده می‌کنیم.
+        # بعد از پیدا شدن نمادهای واجد شرایط، جزئیات کامل در جدول نمایش داده می‌شود.
+        df = get_history(symbol, pages=1)
+        signal = build_signal(df)
+        if signal["side"] == "LONG" and signal["score"] >= min_score:
+            return {
+                "symbol": symbol,
+                "score": signal["score"],
+                "signal": signal["signal"],
+                "price": signal["price"],
+                "entry": signal["entry"],
+                "stop_loss": signal["stop_loss"],
+                "tp1": signal["take_profit_1"],
+                "tp2": signal["take_profit_2"],
+                "rr": signal["risk_reward_tp2"],
+                "rsi": signal["rsi"],
+            }
+    except Exception:
+        return None
+    return None
+
+
+def run_market_scan(min_score=60, workers=8):
+    global SCAN_STATUS
+    try:
+        symbols = [x["symbol"] for x in get_all_symbols()]
+    except Exception as exc:
+        with SCAN_LOCK:
+            SCAN_STATUS.update({
+                "running": False,
+                "finished_at": time.time(),
+                "message": f"دریافت فهرست نمادها ناموفق بود: {exc}",
+            })
+        return
+
+    with SCAN_LOCK:
+        SCAN_STATUS.update({
+            "running": True,
+            "started_at": time.time(),
+            "finished_at": 0,
+            "processed": 0,
+            "total": len(symbols),
+            "matches": 0,
+            "results": [],
+            "errors": 0,
+            "message": f"اسکن {len(symbols)} نماد بازار آغاز شد...",
+        })
+
+    results = []
+    errors = 0
+    # تعداد همزمان محدود نگه داشته شده تا فشار روی Tindex زیاد نشود.
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, 12))) as executor:
+        futures = {executor.submit(scan_one_symbol, sym, min_score): sym for sym in symbols}
+        for future in as_completed(futures):
+            try:
+                item = future.result()
+                if item:
+                    results.append(item)
+            except Exception:
+                errors += 1
+            with SCAN_LOCK:
+                SCAN_STATUS["processed"] += 1
+                SCAN_STATUS["matches"] = len(results)
+                SCAN_STATUS["errors"] = errors
+                SCAN_STATUS["results"] = sorted(results, key=lambda x: (-x["score"], x["symbol"]))
+                SCAN_STATUS["message"] = (
+                    f"در حال اسکن: {SCAN_STATUS['processed']} از {SCAN_STATUS['total']} نماد — "
+                    f"{len(results)} نماد واجد شرایط پیدا شد."
+                )
+
+    with SCAN_LOCK:
+        SCAN_STATUS["running"] = False
+        SCAN_STATUS["finished_at"] = time.time()
+        SCAN_STATUS["results"] = sorted(results, key=lambda x: (-x["score"], x["symbol"]))
+        SCAN_STATUS["matches"] = len(results)
+        SCAN_STATUS["message"] = (
+            f"اسکن کامل شد: از {len(symbols)} نماد، {len(results)} نماد شرایط ورود را داشتند."
+        )
+
+
+def start_market_scan(min_score=60):
+    with SCAN_LOCK:
+        if SCAN_STATUS["running"]:
+            return False
+    thread = threading.Thread(target=run_market_scan, args=(min_score,), daemon=True)
+    thread.start()
+    return True
+
+
 def money(v):
     if v is None or pd.isna(v):
         return "-"
@@ -661,15 +769,17 @@ a{color:#2563eb}
 <body>
 <div class="wrap">
 <div class="card">
-<h1>📊 تحلیل‌گر بورس ایران — نسخه 5.4</h1>
+<h1>📊 تحلیل‌گر بورس ایران — نسخه 5.5</h1>
 <div class="small">منبع داده قیمت: صفحه عمومی تاریخچه سهام Tindex. برای هر تحلیل چند صفحه از تاریخچه دریافت می‌شود و در سرور ۵ دقیقه کش می‌شود.</div>
 <input id="symbol" list="symbolsList" value="استیل" placeholder="جستجوی نماد، مثال: استیل">
 <datalist id="symbolsList"></datalist>
 <div id="symbolCount" class="small">⏳ در حال دریافت فهرست نمادهای بازار...</div>
 <button onclick="analyze()">تحلیل نماد</button>
 <button onclick="backtest()">بک‌تست</button>
+<button onclick="scanMarket()">🔎 اسکن کل بازار</button>
 </div>
 <div id="out"></div>
+<div id="scanOut"></div>
 <div class="card">
 <a href="https://easytrader.emofid.com" target="_blank">ورود به ایزی‌تریدر مفید ↗</a>
 </div>
@@ -750,6 +860,42 @@ async function backtest(){
   <p class="small">${esc(j.note)}</p></div>`;
  }catch(e){document.getElementById('out').innerHTML='<div class="card bad">خطا: '+esc(e.message)+'</div>'}
 }
+async function scanMarket(){
+ document.getElementById('scanOut').innerHTML='<div class="card">⏳ اسکن کل بازار در پس‌زمینه شروع می‌شود...</div>';
+ try{
+  const r=await fetch('/scan/start?min_score=60', {method:'POST'});
+  const j=await r.json();
+  if(!r.ok) throw new Error(j.detail||'خطا در شروع اسکن');
+  pollScan();
+ }catch(e){document.getElementById('scanOut').innerHTML='<div class="card bad">خطا: '+esc(e.message)+'</div>'}
+}
+async function pollScan(){
+ try{
+  const r=await fetch('/scan/status');
+  const j=await r.json();
+  const pct=j.total?Math.round(j.processed/j.total*100):0;
+  let html=`<div class="card"><h2>🔎 اسکن کل بازار</h2>
+   <div class="grid">
+    ${box('وضعیت',j.running?'در حال اسکن':'پایان یافته')}
+    ${box('پیشرفت',pct+'%')}
+    ${box('نمادهای بررسی‌شده',j.processed+' / '+j.total)}
+    ${box('نمادهای واجد شرایط',j.matches)}
+   </div><p class="small">${esc(j.message)}</p>`;
+  if(!j.running && j.results && j.results.length){
+   html+=`<h3>نمادهای دارای شرایط ورود</h3><div style="overflow:auto"><table><thead><tr><th>نماد</th><th>امتیاز</th><th>قیمت</th><th>ورود</th><th>حدضرر</th><th>TP1</th><th>R/R</th><th>RSI</th></tr></thead><tbody>`;
+   for(const x of j.results){
+    html+=`<tr><td><b>${esc(x.symbol)}</b></td><td class="good"><b>${esc(x.score)}</b></td><td>${esc(x.price)}</td><td>${esc(x.entry)}</td><td>${esc(x.stop_loss)}</td><td>${esc(x.tp1)}</td><td>${esc(x.rr)}</td><td>${esc(x.rsi)}</td></tr>`;
+   }
+   html+='</tbody></table></div><p class="small">فقط نمادهای LONG با امتیاز حداقل 60 نمایش داده شده‌اند. برای تصمیم‌گیری نهایی، تحلیل کامل هر نماد را جداگانه اجرا کنید.</p>';
+  } else if(!j.running){
+   html+='<p class="small">در این اسکن نمادی با شرط فعلی پیدا نشد.</p>';
+  }
+  html+='</div>';
+  document.getElementById('scanOut').innerHTML=html;
+  if(j.running) setTimeout(pollScan,2500);
+ }catch(e){document.getElementById('scanOut').innerHTML='<div class="card bad">خطا در دریافت وضعیت اسکن: '+esc(e.message)+'</div>'}
+}
+
 loadSymbols();
 </script>
 </body>
@@ -791,6 +937,25 @@ def backtest(symbol: str = Query(..., min_length=1, max_length=50)):
         return run_backtest(df)
     except Exception as exc:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.post("/scan/start")
+def scan_start(min_score: int = Query(60, ge=50, le=90)):
+    with SCAN_LOCK:
+        if SCAN_STATUS["running"]:
+            return {"started": False, "message": "اسکن دیگری در حال اجراست.", "status": SCAN_STATUS}
+    started = start_market_scan(min_score)
+    return {
+        "started": started,
+        "min_score": min_score,
+        "message": "اسکن کل بازار در پس‌زمینه شروع شد." if started else "اسکن شروع نشد.",
+    }
+
+
+@app.get("/scan/status")
+def scan_status():
+    with SCAN_LOCK:
+        return dict(SCAN_STATUS)
 
 
 @app.get("/symbols")
