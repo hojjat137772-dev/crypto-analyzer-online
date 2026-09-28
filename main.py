@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_VERSION = "5.2.0"
+APP_VERSION = "5.4.0"
 TINDEX_BASE = "https://tindex.app"
 TINDEX_TOKEN = os.getenv("TINDEX_API_TOKEN", "").strip()
 EASYTRADER_URL = "https://easytrader.emofid.com"
@@ -58,6 +58,91 @@ def normalize_header(text):
     s = fa_to_en_digits(text).strip().lower()
     s = s.replace(" ", "").replace("_", "")
     return s
+
+
+SYMBOLS_CACHE = {"time": 0, "rows": []}
+SYMBOLS_CACHE_TTL = 900  # 15 minutes
+
+
+def fetch_stock_list_page(page=1):
+    url = f"{TINDEX_BASE}/en/stocks/"
+    params = {"page": page, "sort": "market_cap"}
+    try:
+        r = SESSION.get(url, params=params, timeout=20)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"دریافت فهرست نمادها از Tindex ناموفق بود: {exc}") from exc
+    if r.status_code != 200:
+        raise RuntimeError(f"Tindex برای فهرست نمادها با کد {r.status_code} پاسخ داد.")
+    return BeautifulSoup(r.text, "html.parser")
+
+
+def parse_stock_list(soup):
+    target = None
+    for table in soup.find_all("table"):
+        header = [normalize_header(x.get_text(" ", strip=True))
+                  for x in table.find_all("tr")[0].find_all(["th", "td"])] if table.find_all("tr") else []
+        if any("symbol" == h or h.startswith("symbol") for h in header):
+            target = table
+            break
+    if target is None:
+        return []
+
+    rows = []
+    for tr in target.find_all("tr")[1:]:
+        links = tr.find_all("a", href=True)
+        symbol = None
+        for a in links:
+            href = a.get("href", "")
+            m = re.search(r"/stocks/([^/?#]+)/?(?:\?|#|$)", href)
+            if m and "/history" not in href:
+                from urllib.parse import unquote
+                symbol = unquote(m.group(1)).strip()
+                break
+        if not symbol:
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+            if cells:
+                symbol = cells[0].split()[0].strip()
+        if symbol and symbol not in {x["symbol"] for x in rows}:
+            rows.append({"symbol": symbol})
+    return rows
+
+
+def get_all_symbols():
+    now = time.time()
+    if SYMBOLS_CACHE["rows"] and now - SYMBOLS_CACHE["time"] < SYMBOLS_CACHE_TTL:
+        return list(SYMBOLS_CACHE["rows"])
+
+    first = fetch_stock_list_page(1)
+    all_rows = parse_stock_list(first)
+    seen = {x["symbol"] for x in all_rows}
+
+    # Tindex pagination links tell us how many pages exist. We use those links
+    # rather than guessing the page size, so changes to the screener remain safe.
+    max_page = 1
+    for a in first.find_all("a", href=True):
+        m = re.search(r"[?&]page=(\d+)", a.get("href", ""))
+        if m:
+            max_page = max(max_page, int(m.group(1)))
+
+    # Safety cap: the current screener is around 1,400 symbols.
+    max_page = min(max_page, 100)
+    for page in range(2, max_page + 1):
+        soup = fetch_stock_list_page(page)
+        page_rows = parse_stock_list(soup)
+        if not page_rows:
+            break
+        added = 0
+        for row in page_rows:
+            if row["symbol"] not in seen:
+                seen.add(row["symbol"])
+                all_rows.append(row)
+                added += 1
+        if added == 0:
+            break
+
+    all_rows.sort(key=lambda x: x["symbol"])
+    SYMBOLS_CACHE.update({"time": now, "rows": all_rows})
+    return list(all_rows)
 
 
 def fetch_history_page(symbol, page=1):
@@ -231,6 +316,19 @@ def support_resistance(df, window=30):
 
 
 def build_signal(df):
+    """Build a 0-100 signal score from independent technical factors.
+
+    Score components:
+      - Trend: 35 points (EMA20/50/200 alignment and price location)
+      - Momentum: 25 points (RSI, with overbought/oversold penalty)
+      - MACD: 15 points
+      - Support/resistance location: 15 points
+      - Risk/reward quality: 10 points
+
+    The score is directional: a high score means bullish conditions,
+    while a low score means bearish conditions. The UI also exposes the
+    component breakdown so the number is not a black box.
+    """
     x = df.copy()
     x["ema20"] = ema(x["close"], 20)
     x["ema50"] = ema(x["close"], 50)
@@ -242,62 +340,146 @@ def build_signal(df):
     last = x.iloc[-1]
     price = float(last["close"])
     atr_v = float(last["atr"]) if pd.notna(last["atr"]) else price * 0.03
-
     support, resistance = support_resistance(x, 30)
 
-    score = 0
-    reasons = []
+    # ---------- 1) Trend: 0..35 ----------
+    trend_score = 0.0
+    trend_reasons = []
+    if price > float(last["ema20"]):
+        trend_score += 8
+        trend_reasons.append("قیمت بالاتر از EMA20")
+    if float(last["ema20"]) > float(last["ema50"]):
+        trend_score += 9
+        trend_reasons.append("EMA20 بالاتر از EMA50")
+    if float(last["ema50"]) > float(last["ema200"]):
+        trend_score += 9
+        trend_reasons.append("EMA50 بالاتر از EMA200")
+    if price > float(last["ema200"]):
+        trend_score += 9
+        trend_reasons.append("قیمت بالاتر از EMA200")
+    # If several trend conditions are bearish, preserve direction in the score.
+    bearish_trend = 0
+    bearish_trend += 1 if price < float(last["ema20"]) else 0
+    bearish_trend += 1 if float(last["ema20"]) < float(last["ema50"]) else 0
+    bearish_trend += 1 if float(last["ema50"]) < float(last["ema200"]) else 0
+    bearish_trend += 1 if price < float(last["ema200"]) else 0
+    if bearish_trend >= 3:
+        trend_score = max(0.0, 35.0 - trend_score)
+        trend_reasons.append("ساختار میانگین‌ها متمایل به نزول است")
 
-    if price > last["ema20"]:
-        score += 1
-        reasons.append("قیمت بالاتر از EMA20 است")
+    # ---------- 2) Momentum / RSI: 0..25 ----------
+    rsi_v = float(last["rsi"])
+    if 55 <= rsi_v <= 68:
+        momentum_score = 25.0
+        momentum_reason = "RSI در محدوده قدرت خرید سالم"
+    elif 50 <= rsi_v < 55:
+        momentum_score = 19.0
+        momentum_reason = "RSI کمی بالاتر از خنثی"
+    elif 68 < rsi_v <= 72:
+        momentum_score = 20.0
+        momentum_reason = "قدرت خرید بالا، با ریسک افزایش اشباع"
+    elif rsi_v > 72:
+        momentum_score = 13.0
+        momentum_reason = "RSI بالا و احتمال اصلاح کوتاه‌مدت"
+    elif 45 <= rsi_v < 50:
+        momentum_score = 11.0
+        momentum_reason = "RSI کمی ضعیف‌تر از خنثی"
     else:
-        score -= 1
-        reasons.append("قیمت پایین‌تر از EMA20 است")
+        momentum_score = 5.0
+        momentum_reason = "مومنتوم ضعیف"
 
-    if price > last["ema50"]:
-        score += 1
-        reasons.append("قیمت بالاتر از EMA50 است")
+    # ---------- 3) MACD: 0..15 ----------
+    macd_v = float(last["macd"])
+    macd_sig = float(last["macd_signal"])
+    hist = float(last["macd_hist"])
+    if macd_v > macd_sig and hist > 0:
+        macd_score = 15.0
+        macd_reason = "MACD و هیستوگرام صعودی"
+    elif macd_v > macd_sig:
+        macd_score = 11.0
+        macd_reason = "MACD بالاتر از خط سیگنال"
+    elif hist > 0:
+        macd_score = 8.0
+        macd_reason = "هیستوگرام MACD مثبت است"
     else:
-        score -= 1
-        reasons.append("قیمت پایین‌تر از EMA50 است")
+        macd_score = 3.0
+        macd_reason = "MACD تأیید صعودی ندارد"
 
-    if price > last["ema200"]:
-        score += 1
-        reasons.append("قیمت بالاتر از EMA200 است")
+    # ---------- 4) Location vs S/R: 0..15 ----------
+    sr_score = 0.0
+    sr_reason = ""
+    span = max(resistance - support, 1e-9)
+    position = (price - support) / span
+    if price > resistance:
+        sr_score = 15.0
+        sr_reason = "قیمت بالاتر از مقاومت اخیر"
+    elif position <= 0.30:
+        sr_score = 14.0
+        sr_reason = "قیمت نزدیک حمایت و دارای فضای رشد"
+    elif position <= 0.55:
+        sr_score = 12.0
+        sr_reason = "فاصله مناسب از حمایت و مقاومت"
+    elif position <= 0.75:
+        sr_score = 8.0
+        sr_reason = "قیمت در نیمه بالایی محدوده"
     else:
-        score -= 1
-        reasons.append("قیمت پایین‌تر از EMA200 است")
+        sr_score = 4.0
+        sr_reason = "قیمت به مقاومت نزدیک است"
 
-    if last["rsi"] >= 55:
-        score += 1
-        reasons.append("RSI متمایل به قدرت خرید است")
-    elif last["rsi"] <= 45:
-        score -= 1
-        reasons.append("RSI متمایل به ضعف است")
-
-    if last["macd"] > last["macd_signal"]:
-        score += 1
-        reasons.append("MACD بالاتر از خط سیگنال است")
+    # ---------- 5) Risk/reward quality: 0..10 ----------
+    proposed_stop = max(support, price - 1.8 * atr_v)
+    if proposed_stop >= price:
+        proposed_stop = price - 1.8 * atr_v
+    risk = max(price - proposed_stop, atr_v * 0.5)
+    rr_to_resistance = (resistance - price) / risk if risk > 0 else 0
+    if rr_to_resistance >= 2.5:
+        rr_score = 10.0
+    elif rr_to_resistance >= 1.8:
+        rr_score = 8.0
+    elif rr_to_resistance >= 1.2:
+        rr_score = 5.0
+    elif rr_to_resistance >= 0.7:
+        rr_score = 2.0
     else:
-        score -= 1
-        reasons.append("MACD پایین‌تر از خط سیگنال است")
+        rr_score = 0.0
 
-    if score >= 3:
-        signal = "خرید / بررسی ورود"
+    bullish_score = int(round(min(100, max(0,
+        trend_score + momentum_score + macd_score + sr_score + rr_score))))
+
+    # Mirror the bullish evidence to obtain a bearish score. This keeps the
+    # displayed number intuitive: 0 = strongly bearish, 50 = mixed, 100 = bullish.
+    bearish_score = int(round(min(100, max(0,
+        (35 - trend_score) + (25 - momentum_score) +
+        (15 - macd_score) + (15 - sr_score) + (10 - rr_score)))))
+
+    # Convert the two-sided evidence into a single 0..100 score.
+    score = int(round(50 + (bullish_score - bearish_score) / 2))
+    score = max(0, min(100, score))
+
+    if score >= 75:
+        signal = "خرید قوی / بررسی ورود"
         side = "LONG"
-        entry = price
-        stop = max(support, price - 1.8 * atr_v)
-        if stop >= entry:
-            stop = price - 1.8 * atr_v
+    elif score >= 60:
+        signal = "خرید مشروط / بررسی ورود"
+        side = "LONG"
+    elif score <= 25:
+        signal = "فروش / اجتناب از ورود"
+        side = "SHORT"
+    elif score <= 40:
+        signal = "ضعیف / اجتناب از ورود"
+        side = "SHORT"
+    else:
+        signal = "خنثی / صبر"
+        side = "WAIT"
+
+    entry = price
+    if side == "LONG":
+        stop = proposed_stop
         risk = max(entry - stop, atr_v * 0.5)
         tp1 = entry + 1.0 * risk
         tp2 = entry + 2.0 * risk
         tp3 = entry + 3.0 * risk
-    elif score <= -3:
-        signal = "فروش / اجتناب از ورود"
-        side = "SHORT"
-        entry = price
+    elif side == "SHORT":
         stop = min(resistance, price + 1.8 * atr_v)
         if stop <= entry:
             stop = price + 1.8 * atr_v
@@ -306,38 +488,54 @@ def build_signal(df):
         tp2 = entry - 2.0 * risk
         tp3 = entry - 3.0 * risk
     else:
-        signal = "خنثی / صبر"
-        side = "WAIT"
-        entry = price
         stop = price - 1.5 * atr_v
+        risk = max(abs(price - stop), atr_v * 0.5)
         tp1 = price + 1.0 * atr_v
         tp2 = price + 2.0 * atr_v
         tp3 = price + 3.0 * atr_v
 
+    # Risk/reward to TP2 for the displayed setup.
+    rr_tp2 = abs(tp2 - entry) / max(abs(entry - stop), 1e-9)
+
+    reasons = trend_reasons + [momentum_reason, macd_reason, sr_reason]
+    if rr_score >= 8:
+        reasons.append("نسبت ریسک/بازده تا مقاومت مناسب است")
+    elif rr_score <= 2:
+        reasons.append("فاصله تا مقاومت برای ورود مستقیم محدود است")
+
     return {
         "signal": signal,
         "side": side,
-        "score": int(score),
+        "score": score,
+        "score_label": "صعودی" if score >= 60 else ("نزولی" if score <= 40 else "خنثی"),
+        "score_breakdown": {
+            "trend": round(float(trend_score), 1),
+            "momentum_rsi": round(float(momentum_score), 1),
+            "macd": round(float(macd_score), 1),
+            "support_resistance": round(float(sr_score), 1),
+            "risk_reward": round(float(rr_score), 1),
+        },
         "price": round(price, 2),
         "entry": round(entry, 2),
         "stop_loss": round(stop, 2),
         "take_profit_1": round(tp1, 2),
         "take_profit_2": round(tp2, 2),
         "take_profit_3": round(tp3, 2),
+        "risk_reward_tp2": round(float(rr_tp2), 2),
         "support": round(support, 2),
         "resistance": round(resistance, 2),
-        "rsi": round(float(last["rsi"]), 2),
+        "rsi": round(rsi_v, 2),
         "ema20": round(float(last["ema20"]), 2),
         "ema50": round(float(last["ema50"]), 2),
         "ema200": round(float(last["ema200"]), 2),
-        "macd": round(float(last["macd"]), 4),
-        "macd_signal": round(float(last["macd_signal"]), 4),
+        "macd": round(macd_v, 4),
+        "macd_signal": round(macd_sig, 4),
         "atr": round(float(atr_v), 2),
         "reasons": reasons,
         "data_points": int(len(x)),
         "last_date": str(pd.Timestamp(last["date"]).date()),
         "data_source": "Tindex public stock history (source shown by Tindex: Tsetmc)",
-        "warning": "این خروجی سیگنال تحلیلی است و تضمین سود یا توصیه سرمایه‌گذاری نیست.",
+        "warning": "امتیاز 0 تا 100 یک مدل تحلیلی است و تضمین سود یا توصیه سرمایه‌گذاری نیست.",
     }
 
 
@@ -463,9 +661,11 @@ a{color:#2563eb}
 <body>
 <div class="wrap">
 <div class="card">
-<h1>📊 تحلیل‌گر بورس ایران — نسخه 5.2</h1>
+<h1>📊 تحلیل‌گر بورس ایران — نسخه 5.4</h1>
 <div class="small">منبع داده قیمت: صفحه عمومی تاریخچه سهام Tindex. برای هر تحلیل چند صفحه از تاریخچه دریافت می‌شود و در سرور ۵ دقیقه کش می‌شود.</div>
-<input id="symbol" value="استیل" placeholder="نماد، مثال: استیل">
+<input id="symbol" list="symbolsList" value="استیل" placeholder="جستجوی نماد، مثال: استیل">
+<datalist id="symbolsList"></datalist>
+<div id="symbolCount" class="small">⏳ در حال دریافت فهرست نمادهای بازار...</div>
 <button onclick="analyze()">تحلیل نماد</button>
 <button onclick="backtest()">بک‌تست</button>
 </div>
@@ -477,6 +677,19 @@ a{color:#2563eb}
 <script>
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function box(label,value){return `<div class="item"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`}
+async function loadSymbols(){
+ try{
+  const r=await fetch('/symbols');
+  const j=await r.json();
+  if(!r.ok) throw new Error(j.detail||'خطا در دریافت نمادها');
+  const list=document.getElementById('symbolsList');
+  list.innerHTML=j.symbols.map(x=>`<option value="${esc(x)}"></option>`).join('');
+  document.getElementById('symbolCount').textContent=`✅ ${j.count} نماد در فهرست بازار موجود است.`;
+ }catch(e){
+  document.getElementById('symbolCount').textContent='⚠️ دریافت فهرست نمادها ناموفق بود؛ می‌توانید نماد را دستی وارد کنید.';
+ }
+}
+
 async function analyze(){
  const s=document.getElementById('symbol').value.trim();
  if(!s)return;
@@ -491,7 +704,9 @@ async function analyze(){
    <h2 class="${cls}">${esc(j.signal)}</h2>
    <div class="grid">
     ${box('قیمت آخر',j.price)}
-    ${box('امتیاز',j.score)}
+    ${box('امتیاز سیگنال (0-100)',j.score)}
+    ${box('وضعیت امتیاز',j.score_label)}
+    ${box('ریسک به ریوارد تا TP2',j.risk_reward_tp2)}
     ${box('ورود',j.entry)}
     ${box('حد ضرر',j.stop_loss)}
     ${box('حد سود ۱',j.take_profit_1)}
@@ -505,6 +720,13 @@ async function analyze(){
     ${box('EMA200',j.ema200)}
    </div>
   </div>
+  <div class="card"><h3>اجزای امتیاز 0 تا 100</h3><div class="grid">
+   ${box('روند (از 35)',j.score_breakdown.trend)}
+   ${box('مومنتوم RSI (از 25)',j.score_breakdown.momentum_rsi)}
+   ${box('MACD (از 15)',j.score_breakdown.macd)}
+   ${box('حمایت/مقاومت (از 15)',j.score_breakdown.support_resistance)}
+   ${box('ریسک/بازده (از 10)',j.score_breakdown.risk_reward)}
+  </div></div>
   <div class="card"><h3>دلایل تحلیل</h3><ul>${j.reasons.map(x=>'<li>'+esc(x)+'</li>').join('')}</ul></div>
   <div class="card small">آخرین تاریخ داده: ${esc(j.last_date)} — تعداد رکورد: ${esc(j.data_points)}<br>${esc(j.data_source)}<br>${esc(j.warning)}</div>`;
  }catch(e){document.getElementById('out').innerHTML='<div class="card bad">خطا: '+esc(e.message)+'</div>'}
@@ -528,6 +750,7 @@ async function backtest(){
   <p class="small">${esc(j.note)}</p></div>`;
  }catch(e){document.getElementById('out').innerHTML='<div class="card bad">خطا: '+esc(e.message)+'</div>'}
 }
+loadSymbols();
 </script>
 </body>
 </html>
@@ -572,7 +795,12 @@ def backtest(symbol: str = Query(..., min_length=1, max_length=50)):
 
 @app.get("/symbols")
 def symbols():
-    return {
-        "note": "جستجوی نماد از API حذف‌شده Tindex استفاده نمی‌کند؛ نماد مستقیماً از صفحه عمومی Tindex خوانده می‌شود.",
-        "example": ["استیل", "شستا", "فملی", "خودرو"],
-    }
+    try:
+        rows = get_all_symbols()
+        return {
+            "count": len(rows),
+            "symbols": [x["symbol"] for x in rows],
+            "data_source": "Tindex public Tehran Stock Exchange screener",
+        }
+    except Exception as exc:
+        return JSONResponse(status_code=502, content={"detail": str(exc)})
