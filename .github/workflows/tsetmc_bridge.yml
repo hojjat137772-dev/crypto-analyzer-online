@@ -1,0 +1,39 @@
+name: TSETMC data bridge
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7,22,37,52 7-15 * * 0-3"
+      timezone: "Asia/Tehran"
+    - cron: "7,22,37,52 8-15 * * 6"
+      timezone: "Asia/Tehran"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requests
+        run: python -m pip install requests
+
+      - name: Fetch TSETMC data
+        run: python scripts/update_tsetmc.py
+
+      - name: Commit data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/market_data.json
+          git diff --cached --quiet || git commit -m "Update TSETMC market data"
+          git push
