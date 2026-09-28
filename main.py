@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_VERSION = "5.6.0"
+APP_VERSION = "5.5.1"
 TINDEX_BASE = "https://tindex.app"
 TINDEX_TOKEN = os.getenv("TINDEX_API_TOKEN", "").strip()
 EASYTRADER_URL = "https://easytrader.emofid.com"
@@ -139,64 +139,94 @@ def parse_stock_list(soup):
     return rows
 
 def get_all_symbols():
-    """Get the symbol list with at most one Tindex request and long caching."""
+    """Load the full Tindex stock screener list for the dropdown.
+
+    The API can be rate-limited to 1 request/minute on the free plan, so the
+    dropdown deliberately uses the public HTML screener pages instead of
+    making dozens of API calls. The result is cached for 6 hours.
+    """
     now = time.time()
-    if SYMBOLS_CACHE["rows"] and now - SYMBOLS_CACHE["time"] < 3600:
+    if SYMBOLS_CACHE["rows"] and now - SYMBOLS_CACHE["time"] < 21600:
         return list(SYMBOLS_CACHE["rows"])
+
+    def parse_screener_page(soup):
+        from urllib.parse import unquote
+        rows = []
+        seen = set()
+        for table in soup.find_all("table"):
+            trs = table.find_all("tr")
+            if not trs:
+                continue
+            header = [normalize_header(x.get_text(" ", strip=True))
+                      for x in trs[0].find_all(["th", "td"])]
+            if not any(h == "symbol" or h.startswith("symbol") for h in header):
+                continue
+            for tr in trs[1:]:
+                a = tr.find("a", href=True)
+                if not a:
+                    continue
+                href = a.get("href", "")
+                m = re.search(r"/(?:en/)?stocks/([^/?#]+)/?(?:\?|#|$)", href)
+                if not m:
+                    continue
+                sym = unquote(m.group(1)).strip()
+                if not sym or len(sym) > 40 or sym in seen:
+                    continue
+                # The first cell is the display ticker; keep the visible name too.
+                cells = tr.find_all(["td", "th"])
+                name = cells[0].get_text(" ", strip=True) if cells else a.get_text(" ", strip=True)
+                rows.append({"symbol": sym, "name": name})
+                seen.add(sym)
+            if rows:
+                break
+        return rows
+
+    # First page gives us the total number of symbols and the first 20 rows.
+    try:
+        soup = fetch_stock_list_page(1)
+        first = parse_screener_page(soup)
+        page_text = soup.get_text(" ", strip=True)
+        m_total = re.search(r"([\d,]+)\s+symbols", page_text, flags=re.I)
+        total = int(m_total.group(1).replace(",", "")) if m_total else 1400
+        last_page = min(80, max(1, (total + 19) // 20))
+    except Exception as exc:
+        # Keep a usable dropdown even when Tindex is temporarily unavailable.
+        fallback = "فملی فولاد خودرو خساپا شستا وبملت وتجارت وبصادر شپنا شبندر شبریز شتران پارسان کگل کچاد ومعادن وغدیر شپترو نوری تاپیکو فارس حکشتی اخابر همراه مبین ذوب جم آریا کرمان کرمانشاه بوعلی وپارس وپاسار وپست وکار وسپهر وبهمن وملت ونیرو وپترو فخوز فخاس فروس فزر فصبا فسبز فاسمین فمراد فجر کگهر کگاز کدما کساپا کشرق کطبس کماسه کمنگنز کپرور کاذر دسبحان دالبر دزهراوی دکوثر تیپیکو برکت والبر وپخش وملل وسینا".split()
+        rows = [{"symbol": x} for x in fallback]
+        SYMBOLS_CACHE["rows"] = rows
+        SYMBOLS_CACHE["time"] = now
+        return list(rows)
 
     all_rows = []
     seen = set()
+    for row in first:
+        if row["symbol"] not in seen:
+            seen.add(row["symbol"])
+            all_rows.append(row)
 
-    # Preferred path: documented Tindex stock reference endpoint.
-    if TINDEX_TOKEN:
-        try:
-            r = SESSION.get(
-                f"{TINDEX_BASE}/api/public/stocks/by-category/stock-energy",
-                headers={
-                    "Authorization": f"Bearer {TINDEX_TOKEN}",
-                    "Accept": "application/json",
-                },
-                params={"lang": "fa", "per_page": 2000},
-                timeout=20,
-            )
-            if r.status_code == 200:
-                payload = r.json()
-                data = payload.get("data", payload)
-                candidates = data.get("rows", []) if isinstance(data, dict) else data
-                if isinstance(candidates, list):
-                    for item in candidates:
-                        if not isinstance(item, dict):
-                            continue
-                        symbol = str(item.get("ticker") or item.get("symbol") or "").strip()
-                        slug = str(item.get("slug") or "").strip()
-                        if symbol and symbol not in seen:
-                            seen.add(symbol)
-                            all_rows.append({
-                                "symbol": symbol,
-                                "slug": slug,
-                                "name": str(item.get("name") or ""),
-                            })
-        except Exception:
-            pass
-
-    # Fallback: ONE HTML page only. Never walk 80 pages just to fill the dropdown.
-    if not all_rows:
-        try:
-            soup = fetch_stock_list_page(1)
-            for row in parse_stock_list(soup):
-                sym = row["symbol"]
-                if sym not in seen:
-                    seen.add(sym)
-                    all_rows.append(row)
-        except Exception:
-            pass
-
-    # Last resort: keep the selector usable even if Tindex is rate-limited.
-    if not all_rows:
-        fallback = "فملی فولاد خودرو خساپا شستا وبملت وتجارت وبصادر شپنا شبندر شبریز شتران پارسان کگل کچاد ومعادن وغدیر شپترو نوری تاپیکو فارس حکشتی اخابر همراه مبین ذوب جم آریا کرمان کرمانشاه بوعلی وپارس وپاسار وپست وکار وسپهر وبهمن وملت ونیرو وپترو فخوز فخاس فروس فزر فصبا فسبز فاسمین فمراد فجر کگهر کگاز کدما کساپا کشرق کطبس کماسه کمنگنز کپرور کاذر دسبحان دالبر دزهراوی دکوثر تیپیکو برکت والبر وپخش وملل وسینا وتجارت".split()
-        all_rows = [{"symbol": x} for x in fallback]
+    # Fetch remaining HTML pages concurrently. These are public website pages,
+    # not API calls, so this does not consume the user's API quota.
+    if last_page > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        def fetch_and_parse(page):
+            try:
+                return parse_screener_page(fetch_stock_list_page(page))
+            except Exception:
+                return []
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futures = [ex.submit(fetch_and_parse, page) for page in range(2, last_page + 1)]
+            for fut in as_completed(futures):
+                for row in fut.result():
+                    sym = row.get("symbol", "")
+                    if sym and sym not in seen:
+                        seen.add(sym)
+                        all_rows.append(row)
 
     all_rows.sort(key=lambda x: x.get("symbol", ""))
+    if len(all_rows) < 100 and first:
+        # Never replace a real partial Tindex result with a hard-coded list.
+        all_rows = first
+
     SYMBOLS_CACHE["rows"] = all_rows
     SYMBOLS_CACHE["time"] = now
     return list(all_rows)
@@ -704,7 +734,7 @@ def scan_one_symbol(symbol, min_score=60):
     try:
         # برای اسکن سریع بازار، از اولین صفحه تاریخچه استفاده می‌کنیم.
         # بعد از پیدا شدن نمادهای واجد شرایط، جزئیات کامل در جدول نمایش داده می‌شود.
-        df = get_history(symbol, pages=1)
+        df = get_history(symbol, pages=2)
         signal = build_signal(df)
         if signal["side"] == "LONG" and signal["score"] >= min_score:
             return {
@@ -724,7 +754,7 @@ def scan_one_symbol(symbol, min_score=60):
     return None
 
 
-def run_market_scan(min_score=60, workers=1):
+def run_market_scan(min_score=60, workers=8):
     global SCAN_STATUS
     try:
         symbols = [x["symbol"] for x in get_all_symbols()]
@@ -823,9 +853,10 @@ a{color:#2563eb}
 <body>
 <div class="wrap">
 <div class="card">
-<h1>📊 تحلیل‌گر بورس ایران — نسخه 5.6</h1>
+<h1>📊 تحلیل‌گر بورس ایران — نسخه 5.5</h1>
 <div class="small">منبع داده قیمت: صفحه عمومی تاریخچه سهام Tindex. برای هر تحلیل چند صفحه از تاریخچه دریافت می‌شود و در سرور ۵ دقیقه کش می‌شود.</div>
-<select id="symbol"><option value="استیل">⏳ در حال دریافت فهرست نمادها...</option></select>
+<input id="symbol" list="symbolsList" value="استیل" placeholder="جستجوی نماد، مثال: استیل">
+<datalist id="symbolsList"></datalist>
 <div id="symbolCount" class="small">⏳ در حال دریافت فهرست نمادهای بازار...</div>
 <button onclick="analyze()">تحلیل نماد</button>
 <button onclick="backtest()">بک‌تست</button>
@@ -841,23 +872,15 @@ a{color:#2563eb}
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function box(label,value){return `<div class="item"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`}
 async function loadSymbols(){
- const select=document.getElementById('symbol');
  try{
   const r=await fetch('/symbols');
   const j=await r.json();
   if(!r.ok) throw new Error(j.detail||'خطا در دریافت نمادها');
-  const items=j.items||j.symbols||[];
-  select.innerHTML=items.map(x=>{
-   const sym=typeof x==='string'?x:(x.symbol||'');
-   const name=typeof x==='string'?'':(x.name||'');
-   return `<option value="${esc(sym)}">${esc(sym)}${name?' — '+esc(name):''}</option>`;
-  }).join('');
-  document.getElementById('symbolCount').textContent=`✅ ${j.count||items.length} نماد آماده است؛ فقط از لیست انتخاب کن.`;
-  const idx=items.findIndex(x=>(typeof x==='string'?x:(x.symbol||''))==='استیل');
-  if(idx>=0) select.selectedIndex=idx;
+  const list=document.getElementById('symbolsList');
+  list.innerHTML=j.symbols.map(x=>`<option value="${esc(x)}"></option>`).join('');
+  document.getElementById('symbolCount').textContent=`✅ ${j.count} نماد در فهرست بازار موجود است.`;
  }catch(e){
-  select.innerHTML='<option value="استیل">استیل</option>';
-  document.getElementById('symbolCount').textContent='⚠️ فهرست موقت بارگذاری شد؛ انتخاب نماد بدون تایپ فعال است.';
+  document.getElementById('symbolCount').textContent='⚠️ دریافت فهرست نمادها ناموفق بود؛ می‌توانید نماد را دستی وارد کنید.';
  }
 }
 
@@ -1025,10 +1048,8 @@ def symbols():
         rows = get_all_symbols()
         return {
             "count": len(rows),
-            "symbols": [x.get("symbol", "") for x in rows],
-            "items": rows,
+            "symbols": [x["symbol"] for x in rows],
             "data_source": "Tindex public Tehran Stock Exchange screener",
-            "version": APP_VERSION,
         }
     except Exception as exc:
-        return JSONResponse(status_code=500, content={"detail": str(exc)})
+        return JSONResponse(status_code=502, content={"detail": str(exc)})
