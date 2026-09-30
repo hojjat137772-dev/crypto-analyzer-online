@@ -1,6 +1,8 @@
 import os
 import re
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 
 import numpy as np
@@ -10,7 +12,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_VERSION = "5.4.0"
+APP_VERSION = "5.6.2"
 TINDEX_BASE = "https://tindex.app"
 TINDEX_TOKEN = os.getenv("TINDEX_API_TOKEN", "").strip()
 EASYTRADER_URL = "https://easytrader.emofid.com"
@@ -77,73 +79,151 @@ def fetch_stock_list_page(page=1):
 
 
 def parse_stock_list(soup):
-    target = None
-    for table in soup.find_all("table"):
-        header = [normalize_header(x.get_text(" ", strip=True))
-                  for x in table.find_all("tr")[0].find_all(["th", "td"])] if table.find_all("tr") else []
-        if any("symbol" == h or h.startswith("symbol") for h in header):
-            target = table
-            break
-    if target is None:
-        return []
+    """Extract stock symbols robustly from Tindex screener HTML.
+
+    Tindex may change the table markup. The stock detail links are more
+    stable than the visible table columns, so use them first and fall back
+    to table rows.
+    """
+    from urllib.parse import unquote
 
     rows = []
-    for tr in target.find_all("tr")[1:]:
-        links = tr.find_all("a", href=True)
-        symbol = None
-        for a in links:
-            href = a.get("href", "")
-            m = re.search(r"/stocks/([^/?#]+)/?(?:\?|#|$)", href)
-            if m and "/history" not in href:
-                from urllib.parse import unquote
-                symbol = unquote(m.group(1)).strip()
-                break
-        if not symbol:
-            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-            if cells:
-                symbol = cells[0].split()[0].strip()
-        if symbol and symbol not in {x["symbol"] for x in rows}:
-            rows.append({"symbol": symbol})
+    seen = set()
+
+    # Primary method: collect stock-detail links from the screener page.
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        m = re.search(r"/(?:en/)?stocks/([^/?#]+)/?(?:\?|#|$)", href)
+        if not m:
+            continue
+        slug = unquote(m.group(1)).strip()
+        if not slug or slug.lower() in {"history", "monthly", "performance", "fundamentals", "valuation"}:
+            continue
+        # Avoid option/contract links and keep only plausible Persian/Latin symbols.
+        if len(slug) > 30 or "/" in slug:
+            continue
+        if slug not in seen:
+            seen.add(slug)
+            rows.append({"symbol": slug})
+
+    if rows:
+        return rows
+
+    # Fallback: parse the first table whose header contains Symbol.
+    for table in soup.find_all("table"):
+        trs = table.find_all("tr")
+        if not trs:
+            continue
+        header = [normalize_header(x.get_text(" ", strip=True))
+                  for x in trs[0].find_all(["th", "td"])]
+        if not any(h == "symbol" or h.startswith("symbol") for h in header):
+            continue
+        for tr in trs[1:]:
+            links = tr.find_all("a", href=True)
+            symbol = None
+            for a in links:
+                href = a.get("href", "")
+                m = re.search(r"/(?:en/)?stocks/([^/?#]+)/?(?:\?|#|$)", href)
+                if m:
+                    symbol = unquote(m.group(1)).strip()
+                    break
+            if not symbol:
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+                if cells:
+                    symbol = cells[0].split()[0].strip()
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                rows.append({"symbol": symbol})
+        if rows:
+            break
     return rows
 
-
 def get_all_symbols():
+    """Load the full Tindex stock screener list for the dropdown.
+
+    The API can be rate-limited to 1 request/minute on the free plan, so the
+    dropdown deliberately uses the public HTML screener pages instead of
+    making dozens of API calls. The result is cached for 6 hours.
+    """
     now = time.time()
-    if SYMBOLS_CACHE["rows"] and now - SYMBOLS_CACHE["time"] < SYMBOLS_CACHE_TTL:
+    if SYMBOLS_CACHE["rows"] and now - SYMBOLS_CACHE["time"] < 21600:
         return list(SYMBOLS_CACHE["rows"])
 
-    first = fetch_stock_list_page(1)
-    all_rows = parse_stock_list(first)
-    seen = {x["symbol"] for x in all_rows}
+    def parse_screener_page(soup):
+        # Tindex currently exposes the stock table with direct /stocks/<slug>/ links.
+        # Parse links first so minor table markup changes do not empty the list.
+        from urllib.parse import unquote
+        rows = []
+        seen = set()
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            m = re.search(r"/(?:en/)?stocks/([^/?#]+)/?(?:\?|#|$)", href)
+            if not m:
+                continue
+            sym = unquote(m.group(1)).strip()
+            if not sym or len(sym) > 40 or sym.lower() in {"history", "monthly", "performance", "fundamentals", "valuation"}:
+                continue
+            if sym in seen:
+                continue
+            text_name = a.get_text(" ", strip=True) or sym
+            rows.append({"symbol": sym, "name": text_name})
+            seen.add(sym)
+        return rows
 
-    # Tindex pagination links tell us how many pages exist. We use those links
-    # rather than guessing the page size, so changes to the screener remain safe.
-    max_page = 1
-    for a in first.find_all("a", href=True):
-        m = re.search(r"[?&]page=(\d+)", a.get("href", ""))
-        if m:
-            max_page = max(max_page, int(m.group(1)))
+    # First page gives us the total number of symbols and the first 20 rows.
+    try:
+        soup = fetch_stock_list_page(1)
+        first = parse_screener_page(soup)
+        page_text = soup.get_text(" ", strip=True)
+        m_total = re.search(r"([\d,]+)\s+symbols", page_text, flags=re.I)
+        total = int(m_total.group(1).replace(",", "")) if m_total else 1400
+        last_page = min(80, max(1, (total + 19) // 20))
+    except Exception as exc:
+        # Keep a usable dropdown even when Tindex is temporarily unavailable.
+        fallback = "فملی فولاد خودرو خساپا شستا وبملت وتجارت وبصادر شپنا شبندر شبریز شتران پارسان کگل کچاد ومعادن وغدیر شپترو نوری تاپیکو فارس حکشتی اخابر همراه مبین ذوب جم آریا کرمان کرمانشاه بوعلی وپارس وپاسار وپست وکار وسپهر وبهمن وملت ونیرو وپترو فخوز فخاس فروس فزر فصبا فسبز فاسمین فمراد فجر کگهر کگاز کدما کساپا کشرق کطبس کماسه کمنگنز کپرور کاذر دسبحان دالبر دزهراوی دکوثر تیپیکو برکت والبر وپخش وملل وسینا".split()
+        rows = [{"symbol": x} for x in fallback]
+        SYMBOLS_CACHE["rows"] = rows
+        SYMBOLS_CACHE["time"] = now
+        return list(rows)
 
-    # Safety cap: the current screener is around 1,400 symbols.
-    max_page = min(max_page, 100)
-    for page in range(2, max_page + 1):
-        soup = fetch_stock_list_page(page)
-        page_rows = parse_stock_list(soup)
-        if not page_rows:
-            break
-        added = 0
-        for row in page_rows:
-            if row["symbol"] not in seen:
-                seen.add(row["symbol"])
-                all_rows.append(row)
-                added += 1
-        if added == 0:
-            break
+    all_rows = []
+    seen = set()
+    for row in first:
+        if row["symbol"] not in seen:
+            seen.add(row["symbol"])
+            all_rows.append(row)
 
-    all_rows.sort(key=lambda x: x["symbol"])
-    SYMBOLS_CACHE.update({"time": now, "rows": all_rows})
+    # Fetch remaining public HTML pages politely and sequentially.
+    # This avoids hammering Tindex and triggering HTTP 429.
+    if last_page > 1:
+        for page in range(2, last_page + 1):
+            page_rows = []
+            for attempt in range(4):
+                try:
+                    page_rows = parse_screener_page(fetch_stock_list_page(page))
+                    break
+                except RuntimeError as exc:
+                    if " 429" not in str(exc) and "429" not in str(exc):
+                        break
+                    time.sleep(3 * (attempt + 1))
+                except Exception:
+                    break
+            for row in page_rows:
+                sym = row.get("symbol", "")
+                if sym and sym not in seen:
+                    seen.add(sym)
+                    all_rows.append(row)
+            # Small pause between pages keeps the public page requests gentle.
+            time.sleep(0.25)
+
+    all_rows.sort(key=lambda x: x.get("symbol", ""))
+    if len(all_rows) < 100 and first:
+        # Never replace a real partial Tindex result with a hard-coded list.
+        all_rows = first
+
+    SYMBOLS_CACHE["rows"] = all_rows
+    SYMBOLS_CACHE["time"] = now
     return list(all_rows)
-
 
 def fetch_history_page(symbol, page=1):
     encoded = quote(symbol.strip(), safe="")
@@ -629,6 +709,112 @@ def run_backtest(df, threshold=2):
     }
 
 
+# وضعیت اسکن بازار در پس‌زمینه
+SCAN_STATUS = {
+    "running": False,
+    "started_at": 0,
+    "finished_at": 0,
+    "processed": 0,
+    "total": 0,
+    "matches": 0,
+    "results": [],
+    "errors": 0,
+    "message": "هنوز اسکن اجرا نشده است.",
+}
+SCAN_LOCK = threading.Lock()
+
+
+def scan_one_symbol(symbol, min_score=60):
+    try:
+        # برای اسکن سریع بازار، از اولین صفحه تاریخچه استفاده می‌کنیم.
+        # بعد از پیدا شدن نمادهای واجد شرایط، جزئیات کامل در جدول نمایش داده می‌شود.
+        df = get_history(symbol, pages=2)
+        signal = build_signal(df)
+        if signal["side"] == "LONG" and signal["score"] >= min_score:
+            return {
+                "symbol": symbol,
+                "score": signal["score"],
+                "signal": signal["signal"],
+                "price": signal["price"],
+                "entry": signal["entry"],
+                "stop_loss": signal["stop_loss"],
+                "tp1": signal["take_profit_1"],
+                "tp2": signal["take_profit_2"],
+                "rr": signal["risk_reward_tp2"],
+                "rsi": signal["rsi"],
+            }
+    except Exception:
+        return None
+    return None
+
+
+def run_market_scan(min_score=60, workers=8):
+    global SCAN_STATUS
+    try:
+        symbols = [x["symbol"] for x in get_all_symbols()]
+    except Exception as exc:
+        with SCAN_LOCK:
+            SCAN_STATUS.update({
+                "running": False,
+                "finished_at": time.time(),
+                "message": f"دریافت فهرست نمادها ناموفق بود: {exc}",
+            })
+        return
+
+    with SCAN_LOCK:
+        SCAN_STATUS.update({
+            "running": True,
+            "started_at": time.time(),
+            "finished_at": 0,
+            "processed": 0,
+            "total": len(symbols),
+            "matches": 0,
+            "results": [],
+            "errors": 0,
+            "message": f"اسکن {len(symbols)} نماد بازار آغاز شد...",
+        })
+
+    results = []
+    errors = 0
+    # تعداد همزمان محدود نگه داشته شده تا فشار روی Tindex زیاد نشود.
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, 12))) as executor:
+        futures = {executor.submit(scan_one_symbol, sym, min_score): sym for sym in symbols}
+        for future in as_completed(futures):
+            try:
+                item = future.result()
+                if item:
+                    results.append(item)
+            except Exception:
+                errors += 1
+            with SCAN_LOCK:
+                SCAN_STATUS["processed"] += 1
+                SCAN_STATUS["matches"] = len(results)
+                SCAN_STATUS["errors"] = errors
+                SCAN_STATUS["results"] = sorted(results, key=lambda x: (-x["score"], x["symbol"]))
+                SCAN_STATUS["message"] = (
+                    f"در حال اسکن: {SCAN_STATUS['processed']} از {SCAN_STATUS['total']} نماد — "
+                    f"{len(results)} نماد واجد شرایط پیدا شد."
+                )
+
+    with SCAN_LOCK:
+        SCAN_STATUS["running"] = False
+        SCAN_STATUS["finished_at"] = time.time()
+        SCAN_STATUS["results"] = sorted(results, key=lambda x: (-x["score"], x["symbol"]))
+        SCAN_STATUS["matches"] = len(results)
+        SCAN_STATUS["message"] = (
+            f"اسکن کامل شد: از {len(symbols)} نماد، {len(results)} نماد شرایط ورود را داشتند."
+        )
+
+
+def start_market_scan(min_score=60):
+    with SCAN_LOCK:
+        if SCAN_STATUS["running"]:
+            return False
+    thread = threading.Thread(target=run_market_scan, args=(min_score,), daemon=True)
+    thread.start()
+    return True
+
+
 def money(v):
     if v is None or pd.isna(v):
         return "-"
@@ -643,33 +829,39 @@ HTML = r"""
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>تحلیل‌گر بورس ایران</title>
 <style>
-body{font-family:Tahoma,Arial,sans-serif;background:#f4f6f8;margin:0;color:#18212b}
-.wrap{max-width:900px;margin:auto;padding:18px}
-.card{background:#fff;border-radius:18px;padding:18px;margin:12px 0;box-shadow:0 5px 20px #00000010}
-h1{margin:0 0 8px;font-size:24px}
-input,button{width:100%;box-sizing:border-box;padding:13px;border-radius:12px;border:1px solid #d5dbe0;font-size:16px}
-button{background:#111827;color:white;border:0;margin-top:10px;cursor:pointer}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
-.item{background:#f8fafc;border-radius:12px;padding:12px}
-.label{font-size:12px;color:#68717b}.value{font-size:18px;font-weight:bold;margin-top:4px}
-.good{color:#087f5b}.bad{color:#c92a2a}.neutral{color:#b26a00}
-.small{font-size:12px;color:#6b7280;line-height:1.8}
-table{width:100%;border-collapse:collapse}td{padding:9px;border-bottom:1px solid #eee}
-a{color:#2563eb}
+body{font-family:Tahoma,Arial,sans-serif;background:linear-gradient(135deg,#eef4ff,#f8fafc 45%,#eefaf6);margin:0;color:#18212b;min-height:100vh}
+.wrap{max-width:980px;margin:auto;padding:18px}
+.card{background:rgba(255,255,255,.92);backdrop-filter:blur(10px);border:1px solid #ffffff;border-radius:22px;padding:20px;margin:14px 0;box-shadow:0 12px 35px #1f3b5d18}
+h1{margin:0 0 8px;font-size:26px;letter-spacing:-.4px}
+.hero{display:flex;justify-content:space-between;gap:14px;align-items:center;margin-bottom:16px}.badge{background:#e8f7f1;color:#087f5b;border-radius:999px;padding:7px 12px;font-size:12px;font-weight:bold}
+label{display:block;font-size:13px;font-weight:bold;margin:12px 0 7px;color:#475569}
+input,select,button{width:100%;box-sizing:border-box;padding:13px 14px;border-radius:14px;border:1px solid #d8e0e8;font-size:16px;background:#fff;outline:none}input:focus,select:focus{border-color:#6b8cff;box-shadow:0 0 0 3px #6b8cff18}
+.searchRow{display:grid;grid-template-columns:1fr 1.4fr;gap:10px}.searchBox{position:relative}.searchIcon{position:absolute;right:12px;top:12px;font-size:18px;color:#94a3b8}.searchBox input{padding-right:40px}
+button{background:linear-gradient(135deg,#172554,#1e40af);color:white;border:0;margin-top:10px;cursor:pointer;font-weight:bold;box-shadow:0 7px 18px #1e40af25;transition:.15s}button:hover{transform:translateY(-1px)}button.secondary{background:#334155}.buttonGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.item{background:#f8fafc;border:1px solid #edf1f5;border-radius:15px;padding:13px}.label{font-size:12px;color:#68717b}.value{font-size:18px;font-weight:bold;margin-top:4px}
+.good{color:#087f5b}.bad{color:#c92a2a}.neutral{color:#b26a00}.small{font-size:12px;color:#6b7280;line-height:1.8}table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px solid #eee;text-align:right}th{background:#f8fafc}a{color:#2563eb}
+@media(max-width:650px){.wrap{padding:10px}.searchRow,.buttonGrid{grid-template-columns:1fr}.hero{align-items:flex-start}.card{padding:15px}}
 </style>
 </head>
 <body>
 <div class="wrap">
 <div class="card">
-<h1>📊 تحلیل‌گر بورس ایران — نسخه 5.4</h1>
+<div class="hero"><div><h1>📊 تحلیل‌گر بورس ایران</h1><div class="small">تحلیل تکنیکال، سیگنال هوشمند، بک‌تست و اسکن بازار</div></div><div class="badge">نسخه 5.6.2</div></div>
 <div class="small">منبع داده قیمت: صفحه عمومی تاریخچه سهام Tindex. برای هر تحلیل چند صفحه از تاریخچه دریافت می‌شود و در سرور ۵ دقیقه کش می‌شود.</div>
-<input id="symbol" list="symbolsList" value="استیل" placeholder="جستجوی نماد، مثال: استیل">
-<datalist id="symbolsList"></datalist>
+<label>انتخاب نماد</label>
+<div class="searchRow">
+ <div class="searchBox"><span class="searchIcon">⌕</span><input id="symbolSearch" placeholder="جستجوی نماد..." oninput="filterSymbols()"></div>
+ <select id="symbol"><option value="">⏳ در حال دریافت فهرست نمادها...</option></select>
+</div>
 <div id="symbolCount" class="small">⏳ در حال دریافت فهرست نمادهای بازار...</div>
-<button onclick="analyze()">تحلیل نماد</button>
-<button onclick="backtest()">بک‌تست</button>
+<div class="buttonGrid">
+<button onclick="analyze()">🔍 تحلیل نماد</button>
+<button class="secondary" onclick="backtest()">🧪 بک‌تست</button>
+<button onclick="scanMarket()">🔎 اسکن کل بازار</button>
+</div>
 </div>
 <div id="out"></div>
+<div id="scanOut"></div>
 <div class="card">
 <a href="https://easytrader.emofid.com" target="_blank">ورود به ایزی‌تریدر مفید ↗</a>
 </div>
@@ -677,17 +869,35 @@ a{color:#2563eb}
 <script>
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function box(label,value){return `<div class="item"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`}
+let allSymbols=[];
 async function loadSymbols(){
  try{
   const r=await fetch('/symbols');
   const j=await r.json();
   if(!r.ok) throw new Error(j.detail||'خطا در دریافت نمادها');
-  const list=document.getElementById('symbolsList');
-  list.innerHTML=j.symbols.map(x=>`<option value="${esc(x)}"></option>`).join('');
-  document.getElementById('symbolCount').textContent=`✅ ${j.count} نماد در فهرست بازار موجود است.`;
+  allSymbols=j.symbols||[];
+  renderSymbols(allSymbols);
+  const list=document.getElementById('symbol');
+  if(j.symbols.includes('استیل')) list.value='استیل';
+  else if(j.symbols.length) list.value=j.symbols[0];
+  document.getElementById('symbolCount').textContent=`✅ ${Number(j.count||0).toLocaleString('fa-IR')} نماد در فهرست بازار موجود است؛ می‌توانی از لیست انتخاب کنی یا جستجو کنی.`;
  }catch(e){
-  document.getElementById('symbolCount').textContent='⚠️ دریافت فهرست نمادها ناموفق بود؛ می‌توانید نماد را دستی وارد کنید.';
+  document.getElementById('symbolCount').textContent='⚠️ دریافت فهرست نمادها ناموفق بود؛ صفحه را دوباره باز کن.';
  }
+}
+
+
+function renderSymbols(items){
+ const list=document.getElementById('symbol');
+ list.innerHTML=items.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');
+ if(items.includes('استیل')) list.value='استیل';
+ else if(items.length) list.value=items[0];
+}
+function filterSymbols(){
+ const q=document.getElementById('symbolSearch').value.trim().toLowerCase();
+ const filtered=!q?allSymbols:allSymbols.filter(x=>String(x).toLowerCase().includes(q));
+ renderSymbols(filtered);
+ document.getElementById('symbolCount').textContent=`🔎 ${filtered.length.toLocaleString('fa-IR')} نماد مطابق جستجو`;
 }
 
 async function analyze(){
@@ -750,6 +960,42 @@ async function backtest(){
   <p class="small">${esc(j.note)}</p></div>`;
  }catch(e){document.getElementById('out').innerHTML='<div class="card bad">خطا: '+esc(e.message)+'</div>'}
 }
+async function scanMarket(){
+ document.getElementById('scanOut').innerHTML='<div class="card">⏳ اسکن کل بازار در پس‌زمینه شروع می‌شود...</div>';
+ try{
+  const r=await fetch('/scan/start?min_score=60', {method:'POST'});
+  const j=await r.json();
+  if(!r.ok) throw new Error(j.detail||'خطا در شروع اسکن');
+  pollScan();
+ }catch(e){document.getElementById('scanOut').innerHTML='<div class="card bad">خطا: '+esc(e.message)+'</div>'}
+}
+async function pollScan(){
+ try{
+  const r=await fetch('/scan/status');
+  const j=await r.json();
+  const pct=j.total?Math.round(j.processed/j.total*100):0;
+  let html=`<div class="card"><h2>🔎 اسکن کل بازار</h2>
+   <div class="grid">
+    ${box('وضعیت',j.running?'در حال اسکن':'پایان یافته')}
+    ${box('پیشرفت',pct+'%')}
+    ${box('نمادهای بررسی‌شده',j.processed+' / '+j.total)}
+    ${box('نمادهای واجد شرایط',j.matches)}
+   </div><p class="small">${esc(j.message)}</p>`;
+  if(!j.running && j.results && j.results.length){
+   html+=`<h3>نمادهای دارای شرایط ورود</h3><div style="overflow:auto"><table><thead><tr><th>نماد</th><th>امتیاز</th><th>قیمت</th><th>ورود</th><th>حدضرر</th><th>TP1</th><th>R/R</th><th>RSI</th></tr></thead><tbody>`;
+   for(const x of j.results){
+    html+=`<tr><td><b>${esc(x.symbol)}</b></td><td class="good"><b>${esc(x.score)}</b></td><td>${esc(x.price)}</td><td>${esc(x.entry)}</td><td>${esc(x.stop_loss)}</td><td>${esc(x.tp1)}</td><td>${esc(x.rr)}</td><td>${esc(x.rsi)}</td></tr>`;
+   }
+   html+='</tbody></table></div><p class="small">فقط نمادهای LONG با امتیاز حداقل 60 نمایش داده شده‌اند. برای تصمیم‌گیری نهایی، تحلیل کامل هر نماد را جداگانه اجرا کنید.</p>';
+  } else if(!j.running){
+   html+='<p class="small">در این اسکن نمادی با شرط فعلی پیدا نشد.</p>';
+  }
+  html+='</div>';
+  document.getElementById('scanOut').innerHTML=html;
+  if(j.running) setTimeout(pollScan,2500);
+ }catch(e){document.getElementById('scanOut').innerHTML='<div class="card bad">خطا در دریافت وضعیت اسکن: '+esc(e.message)+'</div>'}
+}
+
 loadSymbols();
 </script>
 </body>
@@ -791,6 +1037,25 @@ def backtest(symbol: str = Query(..., min_length=1, max_length=50)):
         return run_backtest(df)
     except Exception as exc:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.post("/scan/start")
+def scan_start(min_score: int = Query(60, ge=50, le=90)):
+    with SCAN_LOCK:
+        if SCAN_STATUS["running"]:
+            return {"started": False, "message": "اسکن دیگری در حال اجراست.", "status": SCAN_STATUS}
+    started = start_market_scan(min_score)
+    return {
+        "started": started,
+        "min_score": min_score,
+        "message": "اسکن کل بازار در پس‌زمینه شروع شد." if started else "اسکن شروع نشد.",
+    }
+
+
+@app.get("/scan/status")
+def scan_status():
+    with SCAN_LOCK:
+        return dict(SCAN_STATUS)
 
 
 @app.get("/symbols")
